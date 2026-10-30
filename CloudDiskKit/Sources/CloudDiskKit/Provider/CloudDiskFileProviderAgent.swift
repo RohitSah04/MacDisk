@@ -43,6 +43,7 @@ open class CloudDiskFileProviderAgent: NSObject, NSFileProviderReplicatedExtensi
         // A previous instance may have died between handing a file to the system and the system
         // unlinking it; the provider, not the system, owns those bytes.
         built?.sweepStaleTemporaryFiles()
+        beat()
     }
 
     // MARK: - Lifecycle
@@ -55,10 +56,19 @@ open class CloudDiskFileProviderAgent: NSObject, NSFileProviderReplicatedExtensi
         (running as? [any OperationCanceling])?.forEach { $0.cancelRunningWork() }
     }
 
+    /// Records which appex the system is running for this domain. The app compares that path with its
+    /// own bundle, because no File Provider API lets it ask the system the same question.
+    private func beat() {
+        guard let services else { return }
+        let path = Bundle.main.bundlePath
+        Task { await services.state.recordProviderHeartbeat(extensionBundlePath: path) }
+    }
+
     // MARK: - Enumeration
 
     open func enumerator(for containerItemIdentifier: NSFileProviderItemIdentifier,
                          request: NSFileProviderRequest) throws -> NSFileProviderEnumerator {
+        beat()
         guard let core else {
             throw ProviderErrorMapper.bridge(setupFailure ?? DriveError.misconfigured(
                 detail: "CloudDisk's File Provider extension could not read its configuration."))

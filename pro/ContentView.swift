@@ -1,522 +1,372 @@
-
-import SwiftUI
 import AppKit
-import GoogleSignIn
+import CloudDiskKit
+import SwiftUI
 
-struct DriveFile: Identifiable {
-    let id = UUID()
-    let name: String
-    let type: String
-    let size: String
-    let modified: String
-    let icon: String
-    let color: Color
+/// CloudDisk's status window.
+///
+/// Every value here is read from the running system: the credential in the shared keychain, the
+/// domain registered with File Provider, the quota returned by Drive, and the activity log the
+/// extension writes. Nothing is simulated, so a green row means that part actually works.
+struct ContentView: View {
+    @ObservedObject var core: AppCore
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 20) {
+                header
+
+                if let problem = core.configurationProblem {
+                    Label(problem, systemImage: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                        .padding(14)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 10))
+                }
+
+                statusCard
+                activityCard
+
+                Text("Files in Finder download when you open them. Choose “Keep downloaded” on a file or folder to keep it on this Mac.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+            .padding(24)
+            .frame(maxWidth: 760, alignment: .leading)
+            .frame(maxWidth: .infinity, alignment: .center)
+        }
+        .frame(minWidth: 720, minHeight: 460)
+        .refreshable {
+            await core.refreshStorage()
+        }
+    }
+
+    private var header: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("CloudDisk")
+                .font(.system(size: 26, weight: .semibold, design: .rounded))
+            Text("Your Google Drive as a Finder location")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    // MARK: Status
+
+    private var statusCard: some View {
+        Card(title: "Setup") {
+            accountRow
+            Divider()
+            locationRow
+            Divider()
+            extensionRow
+            Divider()
+            keychainRow
+            Divider()
+            storageRow
+        }
+    }
+
+    @ViewBuilder
+    private var accountRow: some View {
+        switch core.account {
+        case .unknown:
+            Row(title: "Google account", systemImage: "person.crop.circle", tint: .secondary,
+                detail: "Checking the stored credential…") { EmptyView() }
+        case .busy:
+            Row(title: "Google account", systemImage: "person.crop.circle", tint: .secondary,
+                detail: "Waiting for Google to finish sign-in…") {
+                ProgressView().controlSize(.small)
+            }
+        case .signedOut:
+            Row(title: "Google account", systemImage: "person.crop.circle.badge.xmark", tint: .orange,
+                detail: "Not connected. CloudDisk needs full Drive access to read and write files.") {
+                Button("Connect…") {
+                    Task { await core.signIn() }
+                }
+            }
+        case .connected(let email, let name):
+            Row(title: "Google account", systemImage: "checkmark.circle.fill", tint: .green,
+                detail: email ?? name ?? "Connected") {
+                Button("Sign out") {
+                    Task { await core.signOut() }
+                }
+            }
+        case .problem(let message):
+            Row(title: "Google account", systemImage: "exclamationmark.circle.fill", tint: .red,
+                detail: message) {
+                Button("Try again") {
+                    Task { await core.signIn() }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var locationRow: some View {
+        switch core.location {
+        case .unknown:
+            Row(title: "Finder location", systemImage: "menubar.dock.rectangle", tint: .secondary,
+                detail: "Not checked yet.") { EmptyView() }
+        case .registering:
+            Row(title: "Finder location", systemImage: "menubar.dock.rectangle", tint: .secondary,
+                detail: "Registering the CloudDisk domain…") { ProgressView().controlSize(.small) }
+        case .registered(let url):
+            Row(title: "Finder location",
+                systemImage: url == nil ? "clock" : "checkmark.circle.fill",
+                tint: url == nil ? .secondary : .green,
+                detail: url.map(\.path)
+                    ?? "Registered. Finder has not mounted the volume yet — it usually appears within a few seconds.") {
+                if url != nil {
+                    Button("Open in Finder") { core.revealLocation() }
+                } else {
+                    Button("Check again") {
+                        Task { await core.refreshLocation() }
+                    }
+                }
+            }
+        case .absent:
+            Row(title: "Finder location", systemImage: "xmark.circle", tint: .orange,
+                detail: "Not registered. Connecting an account registers it.") { EmptyView() }
+        case .blocked(let message):
+            Row(title: "Finder location", systemImage: "exclamationmark.circle.fill", tint: .red,
+                detail: message) {
+                Button("Register again") {
+                    Task { await core.prepare() }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var extensionRow: some View {
+        switch core.extensionStatus {
+        case .unknown:
+            Row(title: "File Provider extension", systemImage: "puzzlepiece.extension", tint: .secondary,
+                detail: "Not checked yet.") { EmptyView() }
+        case .checking:
+            Row(title: "File Provider extension", systemImage: "puzzlepiece.extension", tint: .secondary,
+                detail: "Asking Finder which CloudDisk extension is serving the location…") {
+                ProgressView().controlSize(.small)
+            }
+        case .live(let at):
+            Row(title: "File Provider extension", systemImage: "checkmark.circle.fill", tint: .green,
+                detail: "Serving this build — last answer \(at.formatted(.relative(presentation: .named))).") {
+                EmptyView()
+            }
+        case .servedByOtherBuild(let path):
+            Row(title: "File Provider extension", systemImage: "exclamationmark.circle.fill", tint: .red,
+                detail: "Re-registering the location did not move it off this older copy: \(path). "
+                      + "Quit CloudDisk and delete that copy, then reopen CloudDisk.") {
+                Button("Check again") {
+                    Task { await core.refreshLocation() }
+                }
+            }
+        case .notAnswering:
+            Row(title: "File Provider extension", systemImage: "exclamationmark.triangle.fill", tint: .orange,
+                detail: "The location is registered but no CloudDisk extension answered, so Finder will "
+                      + "show it empty. This usually means the extension failed its launch checks — "
+                      + "check that this copy of CloudDisk is signed with the same team as its extension.") {
+                Button("Check again") {
+                    Task { await core.refreshLocation() }
+                }
+            }
+        case .unavailable(let message):
+            Row(title: "File Provider extension", systemImage: "exclamationmark.circle.fill", tint: .red,
+                detail: message) {
+                Button("Check again") {
+                    Task { await core.refreshLocation() }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var keychainRow: some View {
+        switch core.credentialStorage {
+        case .unknown:
+            Row(title: "Credential sharing", systemImage: "key.horizontal", tint: .secondary,
+                detail: "Not checked yet.") { EmptyView() }
+        case .usable:
+            Row(title: "Credential sharing", systemImage: "checkmark.circle.fill", tint: .green,
+                detail: "The app and the File Provider extension read one keychain item.") { EmptyView() }
+        case .unusable(let message):
+            Row(title: "Credential sharing", systemImage: "exclamationmark.circle.fill", tint: .red,
+                detail: message) {
+                Button("Re-check") {
+                    Task { await core.prepare() }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var storageRow: some View {
+        switch core.storage {
+        case .unknown:
+            Row(title: "Google Drive storage", systemImage: "internaldrive", tint: .secondary,
+                detail: "Not loaded yet.") { EmptyView() }
+        case .loading:
+            Row(title: "Google Drive storage", systemImage: "internaldrive", tint: .secondary,
+                detail: "Reading the quota from Drive…") { ProgressView().controlSize(.small) }
+        case .loaded(let used, let limit, let accountName):
+            Row(title: "Google Drive storage", systemImage: "internaldrive", tint: .accentColor,
+                detail: usageText(used: used, limit: limit, accountName: accountName)) {
+                Button("Refresh") {
+                    Task { await core.refreshStorage() }
+                }
+            }
+        case .unavailable(let message):
+            Row(title: "Google Drive storage", systemImage: "questionmark.circle", tint: .secondary,
+                detail: message) {
+                Button("Retry") {
+                    Task { await core.refreshStorage() }
+                }
+            }
+        }
+    }
+
+    private func usageText(used: Int64?, limit: Int64?, accountName: String?) -> String {
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .file
+        var text: String
+        if let used, let limit, limit > 0 {
+            text = "\(formatter.string(fromByteCount: used)) of \(formatter.string(fromByteCount: limit)) used"
+        } else if let used {
+            text = "\(formatter.string(fromByteCount: used)) used"
+        } else {
+            text = "Drive did not report a usage figure."
+        }
+        if let accountName, !accountName.isEmpty { text += " — \(accountName)" }
+        return text
+    }
+
+    // MARK: Activity
+
+    private var activityCard: some View {
+        Card(title: "Recent activity") {
+            if core.activity.isEmpty {
+                Text("No downloads, uploads or syncs recorded yet. Actions appear here as you use CloudDisk in Finder.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .padding(.vertical, 4)
+            } else {
+                ForEach(core.activity) { event in
+                    HStack(alignment: .firstTextBaseline, spacing: 10) {
+                        Image(systemName: event.outcome.systemImage)
+                            .foregroundStyle(event.outcome.tint)
+                            .frame(width: 16)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("\(event.kind.phrase) — \(event.subject)")
+                                .lineLimit(2)
+                            if let detail = event.detail, !detail.isEmpty {
+                                Text(detail)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(2)
+                            }
+                        }
+                        Spacer(minLength: 8)
+                        Text(event.date.formatted(.relative(presentation: .named)))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(.vertical, 3)
+                }
+            }
+        }
+    }
 }
 
-struct ContentView: View {
-    @State private var selectedSection = "All Files"
-    @State private var searchText = ""
-    @State private var showingAccountAlert = false
-    @State private var authErrorMessage = ""
-    @State private var accountEmail: String?
-    @State private var isConnecting = false
+// MARK: - Building blocks
 
-    private let driveScope =
-        "https://www.googleapis.com/auth/drive.readonly"
+private struct Card<Content: View>: View {
+    let title: String
+    @ViewBuilder var content: Content
 
-    // Demo data only. Real Google Drive files will be added next.
-    private let files: [DriveFile] = [
-        DriveFile(
-            name: "Project Proposal.pdf",
-            type: "PDF Document",
-            size: "2.4 MB",
-            modified: "Today",
-            icon: "doc.richtext.fill",
-            color: .red
-        ),
-        DriveFile(
-            name: "Budget 2026.xlsx",
-            type: "Spreadsheet",
-            size: "840 KB",
-            modified: "Yesterday",
-            icon: "tablecells.fill",
-            color: .green
-        ),
-        DriveFile(
-            name: "Presentation.pptx",
-            type: "Presentation",
-            size: "5.2 MB",
-            modified: "Oct 27, 2026",
-            icon: "rectangle.on.rectangle",
-            color: .orange
-        ),
-        DriveFile(
-            name: "Profile Photo.png",
-            type: "Image",
-            size: "1.1 MB",
-            modified: "Oct 25, 2026",
-            icon: "photo.fill",
-            color: .purple
-        ),
-        DriveFile(
-            name: "Meeting Notes.docx",
-            type: "Word Document",
-            size: "320 KB",
-            modified: "Oct 24, 2026",
-            icon: "doc.text.fill",
-            color: .blue
-        )
-    ]
-
-    private var filteredFiles: [DriveFile] {
-        let sectionFiles: [DriveFile]
-
-        switch selectedSection {
-        case "Recent":
-            sectionFiles = Array(files.prefix(3))
-        case "Starred", "Trash":
-            sectionFiles = []
-        default:
-            sectionFiles = files
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text(title.uppercased())
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .padding(.bottom, 10)
+            content
         }
+        .padding(18)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
+        .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(.separator, lineWidth: 1))
+    }
+}
 
-        guard !searchText.isEmpty else {
-            return sectionFiles
-        }
+private struct Row<Trailing: View>: View {
+    private let title: String
+    private let systemImage: String
+    private let tint: Color
+    private let detail: String?
+    private let trailing: Trailing
 
-        return sectionFiles.filter {
-            $0.name.localizedCaseInsensitiveContains(searchText)
-        }
+    init(title: String, systemImage: String, tint: Color, detail: String?,
+         @ViewBuilder trailing: () -> Trailing) {
+        self.title = title
+        self.systemImage = systemImage
+        self.tint = tint
+        self.detail = detail
+        self.trailing = trailing()
     }
 
     var body: some View {
-        NavigationSplitView {
-            sidebar
-        } detail: {
-            mainContent
-        }
-        .navigationSplitViewStyle(.balanced)
-        .alert(
-            "Google Drive connection",
-            isPresented: $showingAccountAlert
-        ) {
-            Button("OK", role: .cancel) {}
-        } message: {
-            Text(authErrorMessage)
-        }
-    }
-
-    // MARK: - Sidebar
-
-    private var sidebar: some View {
-        VStack(alignment: .leading, spacing: 20) {
-            HStack(spacing: 10) {
-                Image(systemName: "externaldrive.fill")
-                    .font(.system(size: 25))
-                    .foregroundStyle(.blue)
-
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("CloudDisk")
-                        .font(.title2.bold())
-
-                    Text("Your cloud, together")
-                        .font(.caption)
+        HStack(alignment: .firstTextBaseline, spacing: 12) {
+            Image(systemName: systemImage)
+                .foregroundStyle(tint)
+                .frame(width: 18)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title)
+                if let detail, !detail.isEmpty {
+                    Text(detail)
+                        .font(.callout)
                         .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
                 }
             }
-            .padding(.horizontal, 16)
-            .padding(.top, 18)
-
-            List(selection: $selectedSection) {
-                Section("LIBRARY") {
-                    Label("All Files", systemImage: "folder.fill")
-                        .tag("All Files")
-
-                    Label("Recent", systemImage: "clock")
-                        .tag("Recent")
-
-                    Label("Starred", systemImage: "star")
-                        .tag("Starred")
-
-                    Label("Trash", systemImage: "trash")
-                        .tag("Trash")
-                }
-
-                Section("ACCOUNTS") {
-                    Label(
-                        accountEmail ?? "Google Drive",
-                        systemImage: "cloud"
-                    )
-                    .lineLimit(1)
-                }
-            }
-            .listStyle(.sidebar)
-
-            VStack(alignment: .leading, spacing: 10) {
-                Divider()
-
-                HStack(spacing: 10) {
-                    Image(
-                        systemName: accountEmail == nil
-                            ? "cloud"
-                            : "checkmark.icloud.fill"
-                    )
-                    .font(.title2)
-                    .foregroundStyle(
-                        accountEmail == nil ? Color.secondary : Color.green
-                    )
-
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text(
-                            accountEmail == nil
-                                ? "No accounts connected"
-                                : "Google connected"
-                        )
-                        .font(.subheadline.weight(.medium))
-
-                        Text(accountEmail ?? "Connect your Google Drive")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(2)
-                    }
-                }
-
-                Button {
-                    Task {
-                        await connectGoogleAccount()
-                    }
-                } label: {
-                    Label(
-                        isConnecting ? "Connecting..." : "Connect Account",
-                        systemImage: "plus"
-                    )
-                    .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(isConnecting)
-            }
-            .padding(14)
+            Spacer(minLength: 12)
+            trailing
         }
-        .frame(minWidth: 220)
-    }
-
-    // MARK: - Main content
-
-    private var mainContent: some View {
-        VStack(alignment: .leading, spacing: 24) {
-            HStack {
-                VStack(alignment: .leading, spacing: 5) {
-                    Text(selectedSection)
-                        .font(.largeTitle.bold())
-
-                    Text("Manage your files in one place.")
-                        .foregroundStyle(.secondary)
-                }
-
-                Spacer()
-
-                Button {
-                    Task {
-                        await connectGoogleAccount()
-                    }
-                } label: {
-                    Label(
-                        isConnecting ? "Connecting..." : "Add Account",
-                        systemImage: "plus"
-                    )
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(isConnecting)
-            }
-
-            HStack(spacing: 16) {
-                statCard(
-                    title: "Connected accounts",
-                    value: accountEmail == nil ? "0" : "1",
-                    icon: "person.crop.circle",
-                    color: .blue
-                )
-
-                statCard(
-                    title: "Files shown",
-                    value: "\(filteredFiles.count)",
-                    icon: "doc.on.doc",
-                    color: .purple
-                )
-
-                statCard(
-                    title: "Cloud storage",
-                    value: accountEmail == nil
-                        ? "Not connected"
-                        : "Connected",
-                    icon: "externaldrive",
-                    color: .green
-                )
-            }
-
-            HStack {
-                Image(systemName: "magnifyingglass")
-                    .foregroundStyle(.secondary)
-
-                TextField("Search files...", text: $searchText)
-                    .textFieldStyle(.plain)
-
-                if !searchText.isEmpty {
-                    Button {
-                        searchText = ""
-                    } label: {
-                        Image(systemName: "xmark.circle.fill")
-                            .foregroundStyle(.secondary)
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
-            .padding(10)
-            .background(Color.gray.opacity(0.08))
-            .clipShape(RoundedRectangle(cornerRadius: 10))
-
-            fileTable
-
-            Spacer(minLength: 0)
-
-            HStack {
-                Image(systemName: "info.circle")
-                Text("Preview mode · Sample files only")
-                Spacer()
-                Text("CloudDisk for macOS")
-            }
-            .font(.caption)
-            .foregroundStyle(.secondary)
-        }
-        .padding(28)
-        .frame(minWidth: 650, minHeight: 480)
-    }
-
-    // MARK: - File table
-
-    private var fileTable: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            HStack {
-                Text("NAME")
-                    .frame(maxWidth: .infinity, alignment: .leading)
-
-                Text("TYPE")
-                    .frame(width: 145, alignment: .leading)
-
-                Text("SIZE")
-                    .frame(width: 85, alignment: .trailing)
-
-                Text("MODIFIED")
-                    .frame(width: 115, alignment: .trailing)
-            }
-            .font(.caption.weight(.semibold))
-            .foregroundStyle(.secondary)
-            .padding(12)
-
-            Divider()
-
-            if filteredFiles.isEmpty {
-                VStack(spacing: 12) {
-                    Image(systemName: "folder")
-                        .font(.system(size: 38))
-                        .foregroundStyle(.secondary)
-
-                    Text(
-                        searchText.isEmpty
-                            ? "No files here yet"
-                            : "No matching files"
-                    )
-                    .font(.headline)
-
-                    Text(
-                        searchText.isEmpty
-                            ? "Connect Google Drive to see your files."
-                            : "Try another search."
-                    )
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .padding(40)
-            } else {
-                ScrollView {
-                    VStack(spacing: 0) {
-                        ForEach(filteredFiles) { file in
-                            HStack(spacing: 12) {
-                                Image(systemName: file.icon)
-                                    .font(.title2)
-                                    .foregroundStyle(file.color)
-                                    .frame(width: 28)
-
-                                Text(file.name)
-                                    .lineLimit(1)
-                                    .frame(
-                                        maxWidth: .infinity,
-                                        alignment: .leading
-                                    )
-
-                                Text(file.type)
-                                    .foregroundStyle(.secondary)
-                                    .frame(
-                                        width: 145,
-                                        alignment: .leading
-                                    )
-
-                                Text(file.size)
-                                    .foregroundStyle(.secondary)
-                                    .frame(
-                                        width: 85,
-                                        alignment: .trailing
-                                    )
-
-                                Text(file.modified)
-                                    .foregroundStyle(.secondary)
-                                    .frame(
-                                        width: 115,
-                                        alignment: .trailing
-                                    )
-                            }
-                            .font(.subheadline)
-                            .padding(12)
-
-                            Divider()
-                        }
-                    }
-                }
-            }
-        }
-        .background(Color.gray.opacity(0.035))
-        .clipShape(RoundedRectangle(cornerRadius: 12))
-        .overlay {
-            RoundedRectangle(cornerRadius: 12)
-                .stroke(Color.gray.opacity(0.15), lineWidth: 1)
-        }
-    }
-
-    // MARK: - Google Sign-In and token sharing
-
-    @MainActor
-    private func connectGoogleAccount() async {
-        guard let clientID = Bundle.main.object(
-            forInfoDictionaryKey: "GIDClientID"
-        ) as? String, !clientID.isEmpty else {
-            showAuthError(
-                "Google Client ID is missing. Check GIDClientID in your target's Info settings."
-            )
-            return
-        }
-
-        guard let window = NSApp.keyWindow ?? NSApp.mainWindow else {
-            showAuthError(
-                "CloudDisk could not find its window. Close and reopen the app, then try again."
-            )
-            return
-        }
-
-        isConnecting = true
-        defer {
-            isConnecting = false
-        }
-
-        GIDSignIn.sharedInstance.configuration =
-            GIDConfiguration(clientID: clientID)
-
-        do {
-            let result = try await GIDSignIn.sharedInstance.signIn(
-                withPresenting: window,
-                hint: nil,
-                additionalScopes: [driveScope]
-            )
-
-            // Refresh the Google access token if needed.
-            let refreshedUser =
-                try await result.user.refreshTokensIfNeeded()
-
-            accountEmail = refreshedUser.profile?.email
-                ?? "Google account connected"
-
-            // TEMPORARY DEVELOPMENT BRIDGE:
-            // Share the access token with the File Provider extension
-            // through the shared App Group UserDefaults.
-            guard let sharedDefaults = UserDefaults(
-                suiteName: "group.dev.rohitsah.clouddisk"
-            ) else {
-                throw NSError(
-                    domain: "CloudDisk",
-                    code: 1,
-                    userInfo: [
-                        NSLocalizedDescriptionKey:
-                            "Could not access the shared App Group."
-                    ]
-                )
-            }
-
-            // Save the Google access token.
-            sharedDefaults.set(
-                refreshedUser.accessToken.tokenString,
-                forKey: "GoogleDriveAccessToken"
-            )
-
-            // Save the token expiry time.
-            sharedDefaults.set(
-                refreshedUser.accessToken.expirationDate?
-                    .timeIntervalSince1970 ?? 0,
-                forKey: "GoogleDriveAccessTokenExpiry"
-            )
-
-            authErrorMessage = ""
-
-            print(
-                "Google Sign-In succeeded: \(accountEmail ?? "")"
-            )
-
-            print(
-                "Google Drive access token shared with File Provider."
-            )
-
-        } catch {
-            showAuthError(
-                "Google Sign-In failed: \(error.localizedDescription)"
-            )
-        }
-    }
-
-    @MainActor
-    private func showAuthError(_ message: String) {
-        authErrorMessage = message
-        showingAccountAlert = true
-    }
-
-    // MARK: - Stat card
-
-    private func statCard(
-        title: String,
-        value: String,
-        icon: String,
-        color: Color
-    ) -> some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Image(systemName: icon)
-                .font(.title2)
-                .foregroundStyle(color)
-
-            Text(title)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-
-            Text(value)
-                .font(.title3.bold())
-                .lineLimit(1)
-                .minimumScaleFactor(0.7)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(16)
-        .background(Color.gray.opacity(0.07))
-        .clipShape(RoundedRectangle(cornerRadius: 14))
+        .padding(.vertical, 8)
     }
 }
 
-#Preview {
-    ContentView()
+private extension ProviderState.ActivityEvent.Kind {
+    var phrase: String {
+        switch self {
+        case .download: return "Downloaded"
+        case .upload: return "Uploaded"
+        case .create: return "Created"
+        case .rename: return "Renamed"
+        case .move: return "Moved"
+        case .copy: return "Copied"
+        case .delete: return "Deleted"
+        case .synchronize: return "Synced"
+        case .signIn: return "Connected"
+        case .signOut: return "Signed out of"
+        case .other: return "Recorded"
+        }
+    }
 }
 
+private extension ProviderState.ActivityEvent.Outcome {
+    var systemImage: String {
+        switch self {
+        case .success: return "checkmark.circle.fill"
+        case .failure: return "xmark.circle.fill"
+        case .cancelled: return "slash.circle"
+        }
+    }
+
+    var tint: Color {
+        switch self {
+        case .success: return .green
+        case .failure: return .red
+        case .cancelled: return .secondary
+        }
+    }
+}

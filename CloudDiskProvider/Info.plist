@@ -2,11 +2,25 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<key>GIDClientID</key>
+	<string>$(CLOUDDISK_GOOGLE_CLIENT_ID)</string>
+	<key>CloudDiskKeychainAccessGroup</key>
+	<string>$(AppIdentifierPrefix)dev.rohitsah.clouddisk</string>
+	<key>CloudDiskKeychainUseDataProtectionKeychain</key>
+	<true/>
 	<key>NSExtension</key>
 	<dict>
 		<key>NSExtensionFileProviderDocumentGroup</key>
 		<string>group.dev.rohitsah.clouddisk</string>
 		<key>NSExtensionFileProviderSupportsEnumeration</key>
+		<true/>
+		<key>NSExtensionFileProviderDownloadPipelineDepth</key>
+		<integer>8</integer>
+		<key>NSExtensionFileProviderUploadPipelineDepth</key>
+		<integer>4</integer>
+		<key>NSExtensionFileProviderMetadataOnlyUploadPipelineDepth</key>
+		<integer>8</integer>
+		<key>NSExtensionFileProviderSupportsFailingUploadOnConflict</key>
 		<true/>
 		<key>NSExtensionPointIdentifier</key>
 		<string>com.apple.fileprovider-nonui</string>

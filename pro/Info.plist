@@ -9,11 +9,17 @@
 			<string>Editor</string>
 			<key>CFBundleURLSchemes</key>
 			<array>
-				<string>com.googleusercontent.apps.265151445816-ftndevk4ofq4bhasv77f3cujij41si4n</string>
+				<string>$(CLOUDDISK_GOOGLE_URL_SCHEME)</string>
 			</array>
 		</dict>
 	</array>
 	<key>GIDClientID</key>
-	<string>265151445816-ftndevk4ofq4bhasv77f3cujij41si4n.apps.googleusercontent.com</string>
+	<string>$(CLOUDDISK_GOOGLE_CLIENT_ID)</string>
+	<key>CloudDiskKeychainAccessGroup</key>
+	<string>$(AppIdentifierPrefix)dev.rohitsah.clouddisk</string>
+	<key>CloudDiskKeychainUseDataProtectionKeychain</key>
+	<true/>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.productivity</string>
 </dict>
 </plist>

@@ -8,7 +8,7 @@
 	</array>
 	<key>keychain-access-groups</key>
 	<array>
-		<string>$(AppIdentifierPrefix)$(CFBundleIdentifier)</string>
+		<string>$(AppIdentifierPrefix)dev.rohitsah.clouddisk</string>
 	</array>
 </dict>
 </plist>

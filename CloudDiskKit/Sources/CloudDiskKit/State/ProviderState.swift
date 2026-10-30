@@ -76,6 +76,38 @@ public actor ProviderState {
         try? FileManager.default.removeItem(at: url(for: "changes-cursor.json"))
     }
 
+    // MARK: Extension liveness
+
+    /// Written by the File Provider extension, read by the app: which appex the system really launched.
+    ///
+    /// The system keeps the extension bundle URL it was handed when the domain was registered, and
+    /// neither `NSFileProviderManager` nor `NSFileProviderDomain` lets the app read it back. So after
+    /// a rebuild or a move of the app, a domain can silently stay served by an appex from an older
+    /// installation — or by another app copy that happens to share the bundle identifier. The
+    /// extension records its own bundle path here so the app can compare it against itself.
+    public struct ProviderHeartbeat: Codable, Equatable, Sendable {
+        public var extensionBundlePath: String
+        public var updatedAt: Date
+
+        /// True when this heartbeat came from an extension living inside `appBundleURL`.
+        public func isServedBy(appBundleURL: URL) -> Bool {
+            let root = appBundleURL.standardizedFileURL.path
+            let candidate = URL(fileURLWithPath: extensionBundlePath).standardizedFileURL.path
+            return candidate == root || candidate.hasPrefix(root + "/")
+        }
+    }
+
+    public func providerHeartbeat() -> ProviderHeartbeat? {
+        read(ProviderHeartbeat.self, name: "provider-heartbeat.json")
+    }
+
+    /// Best effort by design: a heartbeat that fails to reach disk only costs the app one liveness
+    /// check, it must never turn into a failed enumeration.
+    public func recordProviderHeartbeat(extensionBundlePath: String) {
+        try? write(ProviderHeartbeat(extensionBundlePath: extensionBundlePath, updatedAt: Date()),
+                   name: "provider-heartbeat.json")
+    }
+
     // MARK: Offline pinning
 
     struct Pins: Codable, Equatable {

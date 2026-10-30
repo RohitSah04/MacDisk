@@ -4,5 +4,5 @@ DerivedData/
 *.xcuserstate
 xcuserdata/
 .DS_Store
-.build/
 CloudDiskKit/.build/
+.xcbuild.log

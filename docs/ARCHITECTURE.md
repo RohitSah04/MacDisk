@@ -75,6 +75,37 @@ lives in the package and is testable without `fileproviderd`.
 
 ## File Provider semantics
 
+### Domain identity, registration and liveness
+
+`CloudDiskDomain` is the single description of the Finder location: identifier
+`primary-google-drive`, display name `CloudDisk`, `supportsSyncingTrash` on because Drive really does
+have a trash. The app calls `register()` on **every** launch, not only the first: the display name and
+the domain features are read from the object passed to `addDomain`, so a domain that is never re-added
+keeps whatever the first-installed build asked for.
+
+What re-adding does **not** do is change which appex the system launches. `fileproviderd` records the
+extension bundle URL the first time it sees a given extension identifier and keeps using that literal
+path afterwards — verified on this Mac (system build 26B123, FP version 4838.41.1) by removing the
+domain with
+`.preserveDownloadedUserData`, re-adding it from a different app copy, restarting `fileproviderd` and
+watching the record stay pointed at the old bundle. `CloudDiskDomain.repair()` performs that
+remove-then-add anyway, because it is what re-creates the domain's replicated volume when the folder
+was left behind by an earlier installation.
+
+Since no public API lets an app read the registered appex path back, the extension records it itself:
+every `CloudDiskFileProviderAgent` writes its own `Bundle.main.bundlePath` into
+`provider-heartbeat.json` in the App Group container at start-up and on each enumeration request. The
+app nudges the domain with `signalEnumerator` and polls that file. Three outcomes, all reported in the
+UI rather than assumed:
+
+| Heartbeat | Meaning | Action |
+| --- | --- | --- |
+| fresh, path inside this app bundle | Finder and the app agree on the live build | none |
+| fresh, path outside this bundle | an older copy still serves the domain | `repair()` once, then re-check |
+| absent after the wait | the extension never started | `repair()` once, then report honestly |
+
+The heartbeat is liveness only. It never carries a token, an account or a URL with credentials.
+
 - Item identifiers are the raw Google Drive file IDs. `root` (the Drive root folder ID) maps to
   `NSFileProviderItemIdentifier.rootContainer`; a synthetic root item is returned for
   `.rootContainer` so parents resolve. Drive IDs are URL-safe alphanumeric+`-_`, which is what the

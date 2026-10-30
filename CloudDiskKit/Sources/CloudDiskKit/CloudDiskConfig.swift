@@ -65,17 +65,25 @@ public struct CloudDiskConfig: Equatable, Sendable {
 
     /// Reads the process' own Info.plist. Works in both the app and the extension because
     /// both bundles carry the same keys.
+    ///
+    /// Unexpanded `$(...)` placeholders are treated as missing configuration: an Info.plist whose
+    /// build setting was never defined reads back as a literal `$(CLOUDDISK_GOOGLE_CLIENT_ID)`,
+    /// which would otherwise be sent to Google as a client id.
     public static func current(bundle: Bundle = .main) throws -> CloudDiskConfig {
         guard let clientID = bundle.object(forInfoDictionaryKey: clientIDPlistKey) as? String,
-              !clientID.isEmpty else {
+              isConfigured(clientID) else {
             throw ConfigError.missingClientID
         }
 
         let accessGroup = bundle.object(forInfoDictionaryKey: keychainAccessGroupPlistKey) as? String
-        if let accessGroup, accessGroup.isEmpty || accessGroup.contains("$(") {
+        if let accessGroup, !isConfigured(accessGroup) {
             throw ConfigError.unresolvedKeychainAccessGroup(accessGroup)
         }
 
         return CloudDiskConfig(clientID: clientID, keychainAccessGroup: accessGroup)
+    }
+
+    private static func isConfigured(_ value: String) -> Bool {
+        !value.isEmpty && !value.contains("$(")
     }
 }
