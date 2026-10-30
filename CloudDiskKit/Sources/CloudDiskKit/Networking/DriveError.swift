@@ -65,15 +65,19 @@ public enum DriveError: Error, Equatable, Sendable {
         case 401:
             return .notAuthenticated(revoked: false)
         case 403:
-            if reason.contains("auth") || lowerMessage.contains("oauth")
-                || lowerMessage.contains("permission disabled") {
-                return .notAuthenticated(revoked: true)
-            }
-            if reason == "userratelexceeded" || reason == "rateLimitExceeded".lowercased() {
+            // Rate limiting arrives as 403 as often as it arrives as 429, and it is the one 403
+            // that has to be retried rather than shown to the user. Both `rateLimitExceeded` and
+            // `userRateLimitExceeded` are matched on a substring so a rename cannot silently
+            // turn a retry into a failure.
+            if reason.contains("ratelimit") {
                 return .rateLimited(retryAfter: nil)
             }
             if reason.contains("storagequota") || lowerMessage.contains("storage quota") {
                 return .storageFull(detail: message)
+            }
+            if reason.contains("auth") || lowerMessage.contains("oauth")
+                || lowerMessage.contains("permission disabled") {
+                return .notAuthenticated(revoked: true)
             }
             return .permissionDenied(detail: message)
         case 404:

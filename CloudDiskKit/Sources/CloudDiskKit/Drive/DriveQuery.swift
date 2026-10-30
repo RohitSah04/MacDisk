@@ -47,7 +47,12 @@ enum DriveQuery {
             .replacingOccurrences(of: "'", with: "\\'")
         var clauses = ["name contains '\(sanitized)'", "trashed = false"]
         if let parentID {
-            clauses.insert("'\(parentID)' in parents", at: 0)
+            // The parent id is interpolated into its own quoted literal, so it is validated rather
+            // than trusted — the same rule `children(of:)` applies.
+            guard isValidIdentifier(parentID) else {
+                throw DriveError.invalidResponse(detail: "rejected unsafe parent identifier")
+            }
+            clauses.insert(escapedStringLiteral(parentID) + " in parents", at: 0)
         }
         return clauses.joined(separator: " and ")
     }

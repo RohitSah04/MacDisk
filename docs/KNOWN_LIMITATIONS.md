@@ -53,8 +53,10 @@ they define what "works like a disk" can mean.
    writing bytes back. CloudDisk advertises them as read-only with an exported representation.
 11. **Full-Drive access needs the sensitive `drive` scope.** In an unverified OAuth consent screen
     this means the "Google hasn't verified this app" interstitial and sign-in restricted to explicit
-    test users. Only `drive.readonly` (current state) is trivially granted; `drive` cannot be
-    requested without the user completing Cloud Console configuration.
+    test users. CloudDisk requests `https://www.googleapis.com/auth/drive` (read/write, per
+    `CloudDiskConfig.driveScope`) because the product requires uploads and edits; the user must add
+    that scope in Google Cloud Console and either publish the consent screen or list themselves as a
+    test user, or sign-in will fail with `access_denied`/`invalid_grant`.
 12. **`alt=media` range support is not universal.** Binary files honour `Range`; Google Docs have no
     media at all; and Drive may return `200` with the whole body instead of `206` for very small or
     oddly-encoded files. The streaming layer must detect that and degrade instead of assuming a `206`.
@@ -76,11 +78,13 @@ Updated as work completes; anything left in this list is not verified.
 | --- | --- |
 | Finder domain registration | **verified**: launching the built app registers domain `primary-google-drive` (display name CloudDisk, `repl,syncTrash`) and `fileproviderd` starts the extension from that bundle; the domain is marked `needs-auth` because no credential exists yet |
 | Extension actually runs this build | **verified**: the live appex process is the one inside the built `CloudDisk.app`, and the system-reported provider flags (`supports failing upload on conflict: 1`) come from this build's Info.plist |
+| Drive request surface (auth, pagination, change feed, retry, ranges, multipart + resumable upload, mutations, exports) | **verified against a stub transport only**: 140 package tests, 0 failures. They prove the bytes CloudDisk sends and Drive's documented response shapes — not Google's real behaviour |
+| Drive service against the live API | **unverified — never run**: `LiveDriveSmokeTests` (14 cases) requires `CLOUDDISK_LIVE_CLIENT_ID` + `CLOUDDISK_LIVE_REFRESH_TOKEN` and reports *skipped*, not passed, without them. No Google credentials exist on this machine, and obtaining them requires the user's browser session |
 | Shared keychain usable at runtime | unverified in UI — entitlements of both bundles are identical (`59YP46BFR2.dev.rohitsah.clouddisk`, checked with `codesign -d --entitlements :-`), the app's probe row needs a look by the user |
 | Finder browsing with real credentials | unverified — needs an interactive Google sign-in by the user |
-| Full-file download on open | to be implemented in Phase 3 |
-| Upload/rename/move/delete | to be implemented in Phase 5 |
-| Byte-range streaming in the built-in player | to be implemented in Phase 4 |
+| Full-file download on open | service layer implemented and stub-tested; provider wiring to be implemented in Phase 3 |
+| Upload/rename/move/delete | service layer implemented and stub-tested; provider wiring to be implemented in Phase 5 |
+| Byte-range streaming in the built-in player | service layer range reads stub-tested; player + `fetchPartialContents` to be implemented in Phase 4 |
 | Persistence across logout/restart of macOS | to be validated in Phase 8 |
 | Developer ID signing + notarization + DMG distribution | **not possible on this machine**: only an Apple Development certificate is installed, so the distributed build will be ad-hoc/development-signed and will not install on another Mac without extra steps |
 | Mac App Store distribution | not attempted (File Provider + sandbox rules differ, and no App Store profile exists) |

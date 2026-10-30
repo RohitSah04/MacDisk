@@ -237,8 +237,7 @@ public struct DriveService: Sendable {
         ]
         let response = try await execute(jsonRequest(
             method: "GET",
-            url: apiURL(path: "/drive/v3/files/\(id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id)",
-                        query: query),
+            url: apiURL(path: "/drive/v3/files/\(encoded(id))", query: query),
             body: nil
         ))
         return try decode(DriveFile.self, from: response, context: "files.get(\(id))")
@@ -282,7 +281,7 @@ public struct DriveService: Sendable {
         ]
         let response = try await execute(jsonRequest(
             method: "PATCH",
-            url: apiURL(path: "/drive/v3/files/\(fileID)", query: query),
+            url: apiURL(path: "/drive/v3/files/\(encoded(fileID))", query: query),
             body: Data("{}".utf8)
         ))
         return try decode(DriveFile.self, from: response, context: "files.update(move)")
@@ -298,7 +297,7 @@ public struct DriveService: Sendable {
         ]
         let response = try await execute(jsonRequest(
             method: "POST",
-            url: apiURL(path: "/drive/v3/files/\(fileID)/copy", query: query),
+            url: apiURL(path: "/drive/v3/files/\(encoded(fileID))/copy", query: query),
             body: try Self.jsonBody(metadata)
         ))
         return try decode(DriveFile.self, from: response, context: "files.copy")
@@ -311,12 +310,34 @@ public struct DriveService: Sendable {
     /// user deletes a second time — from CloudDisk's Trash folder — is exactly the case where
     /// permanent removal is what was asked for.
     public func delete(fileID: String) async throws {
-        let state = try await file(id: fileID, fields: "id,trashed")
+        let state = try await trashState(of: fileID)
         if state.isTrashed {
             try await deletePermanently(fileID: fileID)
         } else {
             _ = try await setTrashed(true, fileID: fileID)
         }
+    }
+
+    /// The delete decision needs two fields, and `DriveFile` cannot be decoded from two fields:
+    /// its `name` and `mimeType` are required. Asking Drive for less than the model needs would
+    /// make every delete fail, so a purpose-built resource is decoded instead.
+    private struct TrashState: Decodable {
+        let id: String
+        let trashed: Bool?
+        var isTrashed: Bool { trashed ?? false }
+    }
+
+    private func trashState(of fileID: String) async throws -> TrashState {
+        let query: [URLQueryItem] = [
+            URLQueryItem(name: "fields", value: "id,trashed"),
+            URLQueryItem(name: "supportsAllDrives", value: "true")
+        ]
+        let response = try await execute(jsonRequest(
+            method: "GET",
+            url: apiURL(path: "/drive/v3/files/\(encoded(fileID))", query: query),
+            body: nil
+        ))
+        return try decode(TrashState.self, from: response, context: "files.get(trash-state)")
     }
 
     /// The raw `trashed` flag write. `delete(fileID:)` is the operation a user expects; this is the
@@ -329,7 +350,7 @@ public struct DriveService: Sendable {
         let query = [URLQueryItem(name: "supportsAllDrives", value: "true")]
         _ = try await execute(jsonRequest(
             method: "DELETE",
-            url: apiURL(path: "/drive/v3/files/\(fileID)", query: query),
+            url: apiURL(path: "/drive/v3/files/\(encoded(fileID))", query: query),
             body: nil
         ))
     }
@@ -339,11 +360,14 @@ public struct DriveService: Sendable {
         let query: [URLQueryItem] = [
             URLQueryItem(name: "fields", value: DriveFile.fields),
             URLQueryItem(name: "supportsAllDrives", value: "true"),
-            URLQueryItem(name: "keepRevisionInTime", value: "false")
+            // `false` is Drive's own default and the behaviour CloudDisk wants: an overwrite does
+            // not pin a forever-revision the user can never delete. The parameter is named here
+            // because an unrecognised query parameter is rejected by the API.
+            URLQueryItem(name: "keepRevisionForever", value: "false")
         ]
         let response = try await execute(jsonRequest(
             method: "PATCH",
-            url: apiURL(path: "/drive/v3/files/\(fileID)", query: query),
+            url: apiURL(path: "/drive/v3/files/\(encoded(fileID))", query: query),
             body: try Self.jsonBody(metadata)
         ))
         return try decode(DriveFile.self, from: response, context: "files.update")

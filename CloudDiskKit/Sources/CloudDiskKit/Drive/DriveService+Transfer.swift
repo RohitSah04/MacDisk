@@ -411,8 +411,15 @@ public extension DriveService {
         return "application/octet-stream"
     }
 
+    /// Percent-encodes a Drive id for use as one path segment.
+    ///
+    /// `.urlPathAllowed` keeps `/`, so an id containing a slash would silently retarget the request
+    /// at a different endpoint. Drive ids never contain one, so dropping the structural characters
+    /// makes a malformed id inert instead of letting it move through the URL tree.
     func encoded(_ fileID: String) -> String {
-        fileID.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? fileID
+        var allowed = CharacterSet.urlPathAllowed
+        allowed.remove(charactersIn: "/?#")
+        return fileID.addingPercentEncoding(withAllowedCharacters: allowed) ?? fileID
     }
 
     static func totalSize(fromContentRange header: String?) -> Int64? {
