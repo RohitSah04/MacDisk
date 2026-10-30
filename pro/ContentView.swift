@@ -21,7 +21,8 @@ struct ContentView: View {
     @State private var accountEmail: String?
     @State private var isConnecting = false
 
-    private let driveScope = "https://www.googleapis.com/auth/drive.readonly"
+    private let driveScope =
+        "https://www.googleapis.com/auth/drive.readonly"
 
     // Demo data only. Real Google Drive files will be added next.
     private let files: [DriveFile] = [
@@ -95,7 +96,10 @@ struct ContentView: View {
             mainContent
         }
         .navigationSplitViewStyle(.balanced)
-        .alert("Google Drive connection", isPresented: $showingAccountAlert) {
+        .alert(
+            "Google Drive connection",
+            isPresented: $showingAccountAlert
+        ) {
             Button("OK", role: .cancel) {}
         } message: {
             Text(authErrorMessage)
@@ -242,7 +246,9 @@ struct ContentView: View {
 
                 statCard(
                     title: "Cloud storage",
-                    value: accountEmail == nil ? "Not connected" : "Connected",
+                    value: accountEmail == nil
+                        ? "Not connected"
+                        : "Connected",
                     icon: "externaldrive",
                     color: .green
                 )
@@ -351,15 +357,24 @@ struct ContentView: View {
 
                                 Text(file.type)
                                     .foregroundStyle(.secondary)
-                                    .frame(width: 145, alignment: .leading)
+                                    .frame(
+                                        width: 145,
+                                        alignment: .leading
+                                    )
 
                                 Text(file.size)
                                     .foregroundStyle(.secondary)
-                                    .frame(width: 85, alignment: .trailing)
+                                    .frame(
+                                        width: 85,
+                                        alignment: .trailing
+                                    )
 
                                 Text(file.modified)
                                     .foregroundStyle(.secondary)
-                                    .frame(width: 115, alignment: .trailing)
+                                    .frame(
+                                        width: 115,
+                                        alignment: .trailing
+                                    )
                             }
                             .font(.subheadline)
                             .padding(12)
@@ -378,7 +393,7 @@ struct ContentView: View {
         }
     }
 
-    // MARK: - Google Sign-In
+    // MARK: - Google Sign-In and token sharing
 
     @MainActor
     private func connectGoogleAccount() async {
@@ -399,7 +414,9 @@ struct ContentView: View {
         }
 
         isConnecting = true
-        defer { isConnecting = false }
+        defer {
+            isConnecting = false
+        }
 
         GIDSignIn.sharedInstance.configuration =
             GIDConfiguration(clientID: clientID)
@@ -411,13 +428,16 @@ struct ContentView: View {
                 additionalScopes: [driveScope]
             )
 
-            let refreshedUser = try await result.user.refreshTokensIfNeeded()
+            // Refresh the Google access token if needed.
+            let refreshedUser =
+                try await result.user.refreshTokensIfNeeded()
 
             accountEmail = refreshedUser.profile?.email
                 ?? "Google account connected"
 
-            // Temporary development bridge for the File Provider extension.
-            // Replace with shared Keychain storage before production.
+            // TEMPORARY DEVELOPMENT BRIDGE:
+            // Share the access token with the File Provider extension
+            // through the shared App Group UserDefaults.
             guard let sharedDefaults = UserDefaults(
                 suiteName: "group.dev.rohitsah.clouddisk"
             ) else {
@@ -431,19 +451,29 @@ struct ContentView: View {
                 )
             }
 
+            // Save the Google access token.
             sharedDefaults.set(
                 refreshedUser.accessToken.tokenString,
                 forKey: "GoogleDriveAccessToken"
             )
 
+            // Save the token expiry time.
             sharedDefaults.set(
-                refreshedUser.accessToken.expirationDate?.timeIntervalSince1970 ?? 0,
+                refreshedUser.accessToken.expirationDate?
+                    .timeIntervalSince1970 ?? 0,
                 forKey: "GoogleDriveAccessTokenExpiry"
             )
 
             authErrorMessage = ""
-            print("Google Sign-In succeeded: \(accountEmail ?? "")")
-            print("Google Drive access token shared with File Provider.")
+
+            print(
+                "Google Sign-In succeeded: \(accountEmail ?? "")"
+            )
+
+            print(
+                "Google Drive access token shared with File Provider."
+            )
+
         } catch {
             showAuthError(
                 "Google Sign-In failed: \(error.localizedDescription)"
@@ -489,3 +519,4 @@ struct ContentView: View {
 #Preview {
     ContentView()
 }
+
