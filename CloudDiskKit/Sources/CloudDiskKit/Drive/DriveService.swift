@@ -421,17 +421,23 @@ public struct DriveService: Sendable {
 
     /// Drains the changes feed from `pageToken` and returns the terminal `newStartPageToken`, which
     /// is what CloudDisk persists as its sync anchor.
+    ///
+    /// `removes` can appear on any page of the drain, not just the last one, and it means Google
+    /// dropped part of the history this token covered. It is therefore accumulated across pages: a
+    /// feed that reported it early and then paged cleanly still has to expire the caller's anchor.
     public func collectChanges(from pageToken: String,
                               maxPages: Int = 50) async throws -> DriveChangeBatch {
         var changes: [DriveChange] = []
         var cursor = pageToken
         var newStart: String?
+        var removedEverything = false
         var pagesRead = 0
 
         while true {
             let page = try await changePage(from: cursor)
             changes.append(contentsOf: page.changeList)
             newStart = page.newStartPageToken ?? newStart
+            removedEverything = removedEverything || (page.removes ?? false)
             pagesRead += 1
 
             guard let next = page.nextPageToken, !next.isEmpty else { break }
@@ -439,7 +445,7 @@ public struct DriveService: Sendable {
                 // `next` is itself a valid changes pageToken, so the caller can resume from it and
                 // still make forward progress instead of losing everything drained so far.
                 return DriveChangeBatch(changes: changes, startPageToken: nil, resumeToken: next,
-                                        removedEverything: page.removes ?? false,
+                                        removedEverything: removedEverything,
                                         truncated: true)
             }
             try Task.checkCancellation()
@@ -450,7 +456,7 @@ public struct DriveService: Sendable {
             throw DriveError.invalidResponse(detail: "changes feed returned no newStartPageToken")
         }
         return DriveChangeBatch(changes: changes, startPageToken: newStart, resumeToken: nil,
-                                removedEverything: false, truncated: false)
+                                removedEverything: removedEverything, truncated: false)
     }
 
     // MARK: Account

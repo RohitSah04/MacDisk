@@ -274,8 +274,10 @@ final class DriveServiceTests: XCTestCase {
         let env = DriveTestEnvironment.make(transport: transport)
 
         let batch = try await env.service.collectChanges(from: "19")
-        XCTAssertFalse(batch.removedEverything,
-                       "only the page that ended the walk decides whether everything is gone")
+        XCTAssertTrue(batch.removedEverything,
+                      "Google marks the purge on the page where history was dropped; a feed that "
+                      + "later pages cleanly still has to expire the caller's anchor")
+
         let purged = StubTransport(script: [
             .json(DriveJSON.changesPage(changes: [], nextPageToken: "only", newStartPageToken: "20",
                                        removes: true)),
@@ -284,6 +286,17 @@ final class DriveServiceTests: XCTestCase {
         let second = DriveTestEnvironment.make(transport: purged)
         let batch2 = try await second.service.collectChanges(from: "19", maxPages: 1)
         XCTAssertTrue(batch2.removedEverything)
+
+        // The other direction: a feed that never mentions `removes` must leave the anchor alone.
+        let clean = DriveTestEnvironment.make(transport: StubTransport(script: [
+            .json(DriveJSON.changesPage(changes: [DriveJSON.change(fileId: "a1aaaaa",
+                                                                  file: DriveJSON.file(id: "a1aaaaa",
+                                                                                      name: "x"))],
+                                       newStartPageToken: "22"))
+        ]))
+        let batch3 = try await clean.service.collectChanges(from: "21")
+        XCTAssertFalse(batch3.removedEverything)
+        XCTAssertEqual(batch3.startPageToken, "22")
     }
 
     func testCollectChangesFailsLoudlyWithoutAStartToken() async throws {

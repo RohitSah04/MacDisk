@@ -58,6 +58,13 @@ final class StubTransport: HTTPTransport, @unchecked Sendable {
     private var script: [Reply]
     private var recorded: [Call] = []
 
+    /// When set, each reply is withheld until this semaphore is signalled.
+    ///
+    /// Lets a test invalidate an enumerator while its Drive request is genuinely still in flight,
+    /// which is the only way to prove the observer is silenced mid-await rather than merely before it
+    /// starts. Waited outside the lock, so recorded calls stay visible while a request is parked.
+    var holdReply: DispatchSemaphore?
+
     init(script: [Reply] = []) {
         self.script = script
     }
@@ -166,6 +173,10 @@ final class StubTransport: HTTPTransport, @unchecked Sendable {
                 throw DriveError.invalidResponse(detail: "StubTransport ran out of scripted responses")
             }
             return script.removeFirst()
+        }
+        if let hold = holdReply {
+            // Bounded, so a forgotten signal fails the test instead of hanging the suite.
+            _ = hold.wait(timeout: .now() + 10)
         }
 
         guard let destination = responseDestination else {

@@ -112,7 +112,12 @@ public actor CloudDiskProviderCore {
     /// The bytes go straight to disk, so a 40 GB file never enters memory, and the item handed back is
     /// built from the metadata fetched alongside that download so its version describes the content on
     /// disk.
+    ///
+    /// `requestedVersion` is the version the system believes it is missing. CloudDisk cannot address a
+    /// Drive revision, so when the server copy no longer matches it the download is discarded and the
+    /// version is reported unavailable rather than answered with newer bytes.
     public func fetchContents(for identifier: NSFileProviderItemIdentifier,
+                              requestedVersion: NSFileProviderItemVersion?,
                               progress: Progress) async throws -> FetchedContent {
         let driveID = try requireDriveID(identifier)
         let destination = try services.temporaryFileURL()
@@ -120,6 +125,12 @@ public actor CloudDiskProviderCore {
         do {
             let file = try await services.drive.download(fileID: driveID, to: destination,
                                                           progress: progress)
+            if let requestedVersion,
+               !requestedVersion.contentVersion.isEmpty,
+               !ProviderIdentity.contentVersion(requestedVersion.contentVersion, matches: file) {
+                try? FileManager.default.removeItem(at: destination)
+                throw DriveError.versionUnavailable
+            }
             await services.cache.store(file)
             let pinned = await services.state.isPinned(driveID)
             try await services.state.record(.init(kind: .download, outcome: .success, subject: file.name))
@@ -381,10 +392,13 @@ public actor CloudDiskProviderCore {
                                options: NSFileProviderModifyItemOptions,
                                progress: Progress) async throws
         -> (item: DriveFile, replaceLocalBytes: Bool) {
-        let base = String(data: baseVersion.contentVersion, encoding: .utf8)
-        let conflicts = (base ?? current.contentVersionToken) != current.contentVersionToken
+        // An empty version means the system never received one for this item, so there is no server
+        // snapshot to have diverged from; anything else is compared byte for byte against the version
+        // the freshly fetched Drive object would be published with.
+        let diverged = !baseVersion.contentVersion.isEmpty
+            && !ProviderIdentity.contentVersion(baseVersion.contentVersion, matches: current)
 
-        if !conflicts {
+        if !diverged {
             let updated = try await services.drive.replaceContents(of: current.id, with: newContents,
                                                                    name: newName, progress: progress)
             return (updated, false)

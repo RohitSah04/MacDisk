@@ -24,12 +24,16 @@ they define what "works like a disk" can mean.
    `evictItem(identifier:completionHandler:)`, but macOS may refuse (`EBUSY` for open descriptors,
    `NSFileProviderErrorUnsyncedEdits` for local edits, `NSFileProviderErrorNonEvictable`). Those
    refusals must be surfaced, not hidden.
-5. **Item identifiers are permanent.** Reusing a Drive ID for a different file is forbidden; Drive's
-   copy operation creates a new ID, which is why "copy in Finder" maps to a real Drive copy rather
-   than a local clone.
-6. **The Trash container requires `NSFileProviderItemCapabilitiesAllowsTrashing`** and an actual trash
-   implementation; Drive supports trashing, but permanently deleting from Finder's trash needs the
-   `delete` API and a `trashed`-aware enumerator, which is extra surface area beyond a first release.
+5. **Item identifiers are permanent.** Reusing a Drive ID for a different file is forbidden. Drive's
+   `files.copy` endpoint exists and CloudDisk's service layer calls it, but the File Provider
+   interface never needs to: a Finder copy is a local clone the system then hands to `createItem` as
+   new content, so the copied row becomes a new Drive object through the upload path.
+6. **Trash needs both a `trashed`-aware enumerator and the real delete API.** Drive trashes a
+   folder's descendants with it while the default children query filters trashed objects out, so
+   CloudDisk lifts that filter for a trashed parent and advertises trashed items with
+   `.allowsDeleting` but not `.allowsTrashing` — that combination is what makes Finder show "delete
+   immediately" and ask its own confirmation first. CloudDisk cannot add a second gate: File Provider
+   exposes no hook between the user's click and `deleteItem`.
 7. **Hard links, symlinks, file permissions, ACLs, xattrs, extended attributes and case-insensitive
    name collisions do not exist in Drive.** Drive is flat-name-per-folder, case-insensitive-ish, with
    no POSIX metadata. Renaming to a name that differs only in case, or creating a name Drive will
@@ -78,12 +82,13 @@ Updated as work completes; anything left in this list is not verified.
 | --- | --- |
 | Finder domain registration | **verified**: launching the built app registers domain `primary-google-drive` (display name CloudDisk, `repl,syncTrash`) and `fileproviderd` starts the extension from that bundle; the domain is marked `needs-auth` because no credential exists yet |
 | Extension actually runs this build | **verified**: the live appex process is the one inside the built `CloudDisk.app`, and the system-reported provider flags (`supports failing upload on conflict: 1`) come from this build's Info.plist |
-| Drive request surface (auth, pagination, change feed, retry, ranges, multipart + resumable upload, mutations, exports) | **verified against a stub transport only**: 140 package tests, 0 failures. They prove the bytes CloudDisk sends and Drive's documented response shapes — not Google's real behaviour |
+| Drive request surface (auth, pagination, change feed, retry, ranges, multipart + resumable upload, mutations, exports) | **verified against a stub transport only**: 229 package tests, 0 failures, 14 skipped. They prove the bytes CloudDisk sends and Drive's documented response shapes — not Google's real behaviour, and not `fileproviderd`'s |
 | Drive service against the live API | **unverified — never run**: `LiveDriveSmokeTests` (14 cases) requires `CLOUDDISK_LIVE_CLIENT_ID` + `CLOUDDISK_LIVE_REFRESH_TOKEN` and reports *skipped*, not passed, without them. No Google credentials exist on this machine, and obtaining them requires the user's browser session |
 | Shared keychain usable at runtime | unverified in UI — entitlements of both bundles are identical (`59YP46BFR2.dev.rohitsah.clouddisk`, checked with `codesign -d --entitlements :-`), the app's probe row needs a look by the user |
 | Finder browsing with real credentials | unverified — needs an interactive Google sign-in by the user |
-| Full-file download on open | service layer implemented and stub-tested; provider wiring to be implemented in Phase 3 |
-| Upload/rename/move/delete | service layer implemented and stub-tested; provider wiring to be implemented in Phase 5 |
+| Provider read path (`item(for:)`, `enumerateItems`, `enumerateChanges`, `fetchContents`, `importDidFinish`) | **stub-verified end to end** through `CloudDiskProviderCore` + `DriveEnumerator`: published items, page/anchor tokens, error codes, cancellation and partial-file cleanup. The scripted observers stand in for `fileproviderd`, so **the system's own behaviour is unverified** |
+| Full-file download on open | wired and stub-verified (metadata → `alt=media`, bytes at the returned URL, progress, no truncated file left behind on failure); unverified against real Drive bytes and a real Finder double-click |
+| Upload/rename/move/delete/trash | wired into `createItem`/`modifyItem`/`deleteItem` and stub-verified, including conflict detection producing a "conflicted copy" instead of an overwrite; unverified in Finder, where the system's own local-dirty/edit handling decides when those calls arrive |
 | Byte-range streaming in the built-in player | service layer range reads stub-tested; player + `fetchPartialContents` to be implemented in Phase 4 |
 | Persistence across logout/restart of macOS | to be validated in Phase 8 |
 | Developer ID signing + notarization + DMG distribution | **not possible on this machine**: only an Apple Development certificate is installed, so the distributed build will be ad-hoc/development-signed and will not install on another Mac without extra steps |

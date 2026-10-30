@@ -148,28 +148,47 @@ public final class DriveFileProviderItem: NSObject, NSFileProviderItem {
         // to describe that format or Quick Look and Finder open the file with the wrong handler.
         if file.isGoogleNative {
             if let mimeType = GoogleWorkspaceExport.exportMimeType(for: file),
-               let type = UTType(mimeType: mimeType) {
+               let type = registeredType(mimeType: mimeType) {
                 return type
             }
             return .content
         }
 
-        if let extensionName = file.fileExtension,
-           let type = UTType(filenameExtension: extensionName) {
+        // Drive's `mimeType` describes the bytes; the name only describes what the user called them,
+        // so a registered type wins over an extension, and an extension wins over nothing.
+        if let type = registeredType(mimeType: file.mimeType) {
             return type
         }
-        if let type = UTType(mimeType: file.mimeType) {
+        // `UTType(mimeType:)` does not return nil for an unregistered MIME string — it synthesizes a
+        // `dyn.` type, which has no declaration and therefore no icon, no Quick Look preview and no
+        // app that will open it. Only a type Launch Services actually knows is usable here.
+        if let extensionName = file.fileExtension, let type = UTType(filenameExtension: extensionName),
+           !type.isDynamic {
             return type
         }
-        // Drive reports no MIME type for some binaries; fall back to the name so a .zip still opens.
-        if let type = UTType(filenameExtension: (file.name as NSString).pathExtension) {
+        if let type = UTType(filenameExtension: (file.name as NSString).pathExtension),
+           !type.isDynamic {
             return type
         }
         return .data
     }
 
+    private static func registeredType(mimeType: String) -> UTType? {
+        guard let type = UTType(mimeType: mimeType), !type.isDynamic else { return nil }
+        return type
+    }
+
     static func capabilities(of file: DriveFile) -> NSFileProviderItemCapabilities {
         let permissions = file.capabilities ?? DriveCapabilities()
+
+        if file.isTrashed {
+            // Nothing left in the trash may be edited or trashed a second time; `.allowsDeleting`
+            // without `.allowsTrashing` is what makes Finder offer "delete immediately".
+            var trashed: NSFileProviderItemCapabilities = [.allowsReading, .allowsDeleting]
+            if file.isFolder { trashed.insert(.allowsContentEnumerating) }
+            return trashed
+        }
+
         var result: NSFileProviderItemCapabilities = []
 
         if permissions.isReadable { result.insert(.allowsReading) }

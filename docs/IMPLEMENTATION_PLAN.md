@@ -83,12 +83,59 @@ handling. **It has never been run.** Without `CLOUDDISK_LIVE_CLIENT_ID` /
 **Exit criteria met:** package builds, `swift test` green, both app targets still build. Not met, and
 not claimable here: anything requiring a real Google account or a signed-in Finder session.
 
-## Phase 3 — Read-only provider
+## Phase 3 — Read-only provider (done as far as this machine allows)
 
-Real `item(for:)`, `fetchContents`, paged `enumerateItems`, working-set change enumeration with
-persisted anchors, `enumerator(for:)` returning nil with the right error for non-containers,
-cancellation wired to the returned `Progress`, correct root container.
-Validated by launching the app on this Mac and inspecting the registered domain.
+`item(for:)`, `enumerateItems`, `enumerateChanges`, `fetchContents`, `enumerator(for:)`,
+`importDidFinish` and the trash/working-set containers all do real Drive work through
+`CloudDiskProviderCore`; the appex (`CloudDiskFileProviderAgent`) is a translation layer over it.
+Validated by driving the core with scripted Drive replies and the two observer objects the system
+would hand the enumerator.
+
+**Verified (229 package tests, 0 failures, 14 skipped; `swift build`, `swift build --build-tests`,
+`xcodebuild -scheme CloudDisk` all green, `CloudDiskProvider.appex` embedded in the built app).**
+Stub-verified again — the transport is scripted, so this proves CloudDisk's half of the File Provider
+contract, not `fileproviderd`'s behaviour:
+
+| Area | Proven by |
+| --- | --- |
+| Identity | Drive id ⇄ `NSFileProviderItemIdentifier` round trip, foreign identifiers rejected as `noSuchItem` without a request, virtual containers answered locally, version bytes namespaced per item and inside the system's length limit |
+| Metadata | one request per file reused while a page is built, `contentPolicy` from pin state, trashed items advertising read/delete-without-trash so Finder offers "delete immediately", type resolution preferring a registered MIME over a conflicting extension and never handing Launch Services a synthesized `dyn.` type |
+| Enumeration | paged `didEnumerate` → `finishEnumerating(upTo:)` with the next page token, root/trash container queries, a trashed folder listing the children Drive trashed with it, shortcuts published as their target (and still listed when the target cannot be read, rather than hidden) |
+| Change feed | stored cursor reused without re-asking Google, changes → `didUpdate_items`/`didDelete_items`, truncated drain reporting `moreComing` with a **resume** anchor rather than rewinding, `importDidFinish` establishing the anchor exactly once, 410 expiring the anchor and dropping the stored token |
+| Cancellation | an enumerator invalidated while its Drive request is in flight publishes nothing and never touches the released observer |
+| Download | metadata-then-media, bytes on disk at the URL handed to the system, progress, folder refused before any transfer, a failed media request leaving no partial file and recording `.failure`, no token text in activity |
+| Versioning | a `fetchContents` for a version Drive has moved past refused with `versionNoLongerAvailable` instead of answering with newer bytes; a still-matching version served normally |
+| Writing | create folder/file (multipart envelope asserted on the wire), rename, move, trash-vs-purge, conflict detection producing a "conflicted copy" rather than an overwrite, tag/symlink/alias refused, non-empty folder delete refused with `directoryNotEmpty`. Drive's `files.copy` endpoint is stub-tested at the service layer but the provider never calls it — a Finder copy is a local clone followed by `createItem` with contents, which is what is tested here |
+| Error bridge | every `DriveError` landing in `NSFileProviderErrorDomain`/`NSCocoaErrorDomain` with the documented code, so nothing becomes an infinite retry |
+
+**Six defects found by this suite and fixed** — each was a live failure mode:
+1. The enumerator called `didEnumerate`/`finishEnumerating` on observers after `invalidate()`. The
+   system releases the observer when it discards an enumerator, so a Drive reply landing after that
+   is a use-after-free in `fileproviderd`'s address space. Observers are now held behind a gate
+   closed *before* the tasks are cancelled.
+2. Conflict detection never fired. `uploadContent` compared the system's `baseVersion` against the
+   server by UTF-8-decoding the version bytes — but those bytes are `SHA-256(item id)` prefix + token
+   and are usually not valid UTF-8, so the decode returned nil and *every* edit looked unchanged.
+   Finder would have silently overwritten a remote edit. The comparison now re-derives the version and
+   compares `Data`.
+3. `removes` was only honoured on the last page of a changes walk, so a purge that Google marks
+   mid-feed left the app believing it still had a valid anchor.
+4. An expired anchor was reported to the system but the stored cursor was never cleared, so every
+   subsequent walk resumed from the same rejected token — a permanent loop.
+5. Change enumeration drained up to 50 pages inside one `enumerateChanges` call, and the scoped
+   enumerator finished by publishing the token it *started* from, rewinding the system's cursor on
+   every cycle. Now a bounded 10-page drain returning the resume token.
+6. `fetchContents` ignored `requestedVersion`, so a request for a specific version was answered with
+   whatever bytes Drive held at that moment.
+
+Fixes 1 and 6 were **mutation-verified**, as was shortcut resolution: deleting the gate close,
+deleting the version check and neutering `resolveShortcut` each make the corresponding test fail
+(test 1 initially passed without the fix, which is how the in-flight case and
+`StubTransport.holdReply` came to exist).
+
+**Not verified and not claimable here:** that Finder shows a folder, that a double-click downloads,
+that restart keeps the domain mounted, that eviction works. Those need `fileproviderd`, a signed-in
+Google account, and a UI session — recorded in `docs/KNOWN_LIMITATIONS.md`.
 
 ## Phase 4 — Streaming + previews
 

@@ -51,6 +51,12 @@ public enum ProviderIdentity {
 
     /// The single parent File Provider will replicate this item under.
     static func parentIdentifier(for file: DriveFile) -> NSFileProviderItemIdentifier {
+        if file.isTrashed {
+            // Drive keeps reporting the folder a trashed object came from. A children query excludes
+            // trashed items, so that parent would hold a row the system can never list — and the
+            // user could not empty it. Trash is the only place a trashed item can live.
+            return trashIdentifier
+        }
         guard let parent = file.parentID else {
             // Drive omits `parents` for items reachable only through a shared-drive shortcut or
             // when the caller lacks the permission to see the parent. Root is the only safe answer:
@@ -62,19 +68,39 @@ public enum ProviderIdentity {
 
     // MARK: Versions
 
-    /// `NSFileProviderItemVersion` components are capped at 128 bytes, while a Drive name can reach
-    /// 1024 characters, so the metadata component is hashed instead of stored verbatim.
+    /// The system caps each version component at 128 bytes. Drive's revision ids and checksums fit
+    /// comfortably, but a token is only useful if it is *different* for different content, so an
+    /// unexpectedly long one is hashed rather than truncated — truncating could make two revisions
+    /// look identical and leave the system serving stale bytes.
+    static let maximumVersionComponentByteCount = 128
+
+    /// Metadata for an item changes with its name, parent, star and trash state, and a Drive name can
+    /// reach 1024 characters, so the metadata component is hashed even when it would fit.
     static func itemVersion(for file: DriveFile) -> NSFileProviderItemVersion {
-        let content = Data(file.contentVersionToken.utf8)
-        let metadata = Data(SHA256.hash(data: Data(file.metadataVersionToken.utf8)))
-        return NSFileProviderItemVersion(contentVersion: prefix(file.id, content),
-                                        metadataVersion: prefix(file.id, metadata))
+        NSFileProviderItemVersion(
+            contentVersion: bounded(file.id, Data(file.contentVersionToken.utf8)),
+            metadataVersion: bounded(file.id, Data(SHA256.hash(data: Data(file.metadataVersionToken.utf8))))
+        )
     }
 
-    /// Namespace component bytes with the item id so two items cannot present the same version data.
-    private static func prefix(_ id: String, _ bytes: Data) -> Data {
+    /// Decides whether the version bytes the system handed back still describe the server copy.
+    ///
+    /// The comparison re-derives the version from `file` instead of decoding `version`: the encoded
+    /// form is namespaced with the item id and, for long tokens, hashed, so the Drive token cannot be
+    /// read back out of it. Decoding the raw bytes as UTF-8 — the obvious shortcut — fails outright,
+    /// because the id namespace prefix is hash bytes that are usually not valid UTF-8.
+    static func contentVersion(_ version: Data, matches file: DriveFile) -> Bool {
+        version == itemVersion(for: file).contentVersion
+    }
+
+    /// Namespaces the component with the item id, so two items can never present the same version
+    /// bytes, and keeps the result inside the system's limit.
+    private static func bounded(_ id: String, _ bytes: Data) -> Data {
         let tag = Data(SHA256.hash(data: Data(id.utf8)).prefix(8))
-        return tag + bytes
+        let payload = bytes.count <= maximumVersionComponentByteCount - tag.count
+            ? bytes
+            : Data(SHA256.hash(data: bytes))
+        return tag + payload
     }
 }
 

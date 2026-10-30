@@ -109,12 +109,40 @@ extension ProviderServices {
     /// `item(for:)` calls the system makes right after an enumeration stay local.
     func items(from files: [DriveFile]) async -> [NSFileProviderItem] {
         let pins = await state.pinnedDriveIDs()
-        for file in files { await cache.store(file) }
-        return files.map { file in
-            DriveFileProviderItem.make(from: file,
-                                       contentPolicy: pins.contains(file.id)
-                                        ? .downloadEagerlyAndKeepDownloaded : .downloadLazily)
+        var result: [NSFileProviderItem] = []
+        result.reserveCapacity(files.count)
+        for file in files {
+            let resolved = await resolveShortcut(file)
+            await cache.store(resolved)
+            result.append(DriveFileProviderItem.make(
+                from: resolved,
+                contentPolicy: pins.contains(resolved.id)
+                    ? .downloadEagerlyAndKeepDownloaded : .downloadLazily))
         }
+        return result
+    }
+
+    /// Follows a Drive shortcut to the object it points at.
+    ///
+    /// A shortcut has no bytes and no type of its own, so handing it to Finder produces a row that
+    /// cannot be opened. If the target is not readable the shortcut is still listed: dropping the row
+    /// would hide something the user can see on drive.google.com.
+    func resolveShortcut(_ file: DriveFile) async -> DriveFile {
+        guard file.isShortcut, let target = file.shortcutDetails?.targetId else { return file }
+        return (try? await drive.file(id: target)) ?? file
+    }
+
+    /// True when a folder's own children have to be asked for with trashed items included.
+    ///
+    /// Drive trashes a folder's descendants with it, and the default children query filters trashed
+    /// objects out — so listing a trashed folder would show an empty directory whose files still
+    /// exist in the trash.
+    func listsTrashedChildren(parentDriveID: String) async -> Bool {
+        guard parentDriveID != DriveFile.rootFolderID else { return false }
+        if let cached = await cache.cachedValue(forDriveID: parentDriveID) {
+            return cached.isTrashed
+        }
+        return (try? await drive.file(id: parentDriveID))?.isTrashed ?? false
     }
 
     var rootItem: NSFileProviderItem {

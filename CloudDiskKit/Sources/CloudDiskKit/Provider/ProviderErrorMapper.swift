@@ -70,6 +70,22 @@ public enum ProviderErrorMapper {
         return NSError.fileProviderErrorForCollision(with: existingItem)
     }
 
+    /// True for the one failure that also changes what the extension must store.
+    ///
+    /// An expired anchor is the only error the system recovers from by asking for a new one, so the
+    /// dead Drive token has to be dropped from shared state at the same moment — otherwise
+    /// `currentSyncAnchor` hands the same unusable value back and the two sides loop. Checked on the
+    /// bridged `NSError` because the Swift `NSFileProviderError` value and the `NSError` a caller
+    /// receives after one round trip are different types.
+    static func isAnchorExpired(_ error: Error) -> Bool {
+        if let driveError = error as? DriveError, case .syncCursorExpired = driveError {
+            return true
+        }
+        let bridged = error as NSError
+        return bridged.domain == NSFileProviderErrorDomain
+            && bridged.code == NSFileProviderError.Code.syncAnchorExpired.rawValue
+    }
+
     /// The core's own failures map onto dedicated File Provider codes, because each one tells the
     /// system what to do next rather than merely that something went wrong.
     static func bridge(coreError: CloudDiskProviderCore.CoreError) -> NSError {

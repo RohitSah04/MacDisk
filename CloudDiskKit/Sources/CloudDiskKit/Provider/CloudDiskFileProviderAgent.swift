@@ -119,7 +119,9 @@ open class CloudDiskFileProviderAgent: NSObject, NSFileProviderReplicatedExtensi
 
         operation.start { [core] progress in
             guard let core else { throw try self.configurationError() }
-            return try await core.fetchContents(for: itemIdentifier, progress: progress)
+            return try await core.fetchContents(for: itemIdentifier,
+                                                requestedVersion: requestedVersion,
+                                                progress: progress)
         }
         return operation.progress
     }
