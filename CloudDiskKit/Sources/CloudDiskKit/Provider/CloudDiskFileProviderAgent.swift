@@ -11,7 +11,8 @@ import FileProvider
 ///
 /// The appex target subclasses this with an empty body; that subclass name is what the extension's
 /// `NSExtensionPrincipalClass` points at.
-open class CloudDiskFileProviderAgent: NSObject, NSFileProviderReplicatedExtension {
+open class CloudDiskFileProviderAgent: NSObject, NSFileProviderReplicatedExtension,
+                                       NSFileProviderPartialContentFetching {
 
     public let domain: NSFileProviderDomain
 
@@ -122,6 +123,43 @@ open class CloudDiskFileProviderAgent: NSObject, NSFileProviderReplicatedExtensi
             return try await core.fetchContents(for: itemIdentifier,
                                                 requestedVersion: requestedVersion,
                                                 progress: progress)
+        }
+        return operation.progress
+    }
+
+    // MARK: - Partial download
+
+    /// Serves one byte extent so the system can materialize the part a reader actually touched.
+    ///
+    /// Conforming to `NSFileProviderPartialContentFetching` is the opt-in: without it every read of a
+    /// dataless file downloads the whole object.
+    open func fetchPartialContents(for itemIdentifier: NSFileProviderItemIdentifier,
+                                   version requestedVersion: NSFileProviderItemVersion,
+                                   request: NSFileProviderRequest,
+                                   minimalRange requestedRange: NSRange,
+                                   aligningTo alignment: Int,
+                                   options: NSFileProviderFetchContentsOptions,
+                                   completionHandler: @escaping (URL?, NSFileProviderItem?, NSRange,
+                                                                 NSFileProviderMaterializationFlags,
+                                                                 (any Error)?) -> Void) -> Progress {
+        let operation = ProviderOperation<CloudDiskProviderCore.FetchedExtent>(deliver: { result in
+            switch result {
+            case .success(let extent):
+                completionHandler(extent.url, extent.item, extent.retrievedRange, extent.flags, nil)
+            case .failure(let error):
+                completionHandler(nil, nil, requestedRange, [], ProviderErrorMapper.bridge(error))
+            }
+        })
+        register(operation)
+
+        operation.start { [core] progress in
+            guard let core else { throw try self.configurationError() }
+            return try await core.fetchPartialContents(for: itemIdentifier,
+                                                       requestedVersion: requestedVersion,
+                                                       minimalRange: requestedRange,
+                                                       aligningTo: alignment,
+                                                       strictVersioning: options.contains(.strictVersioning),
+                                                       progress: progress)
         }
         return operation.progress
     }

@@ -139,8 +139,54 @@ Google account, and a UI session — recorded in `docs/KNOWN_LIMITATIONS.md`.
 
 ## Phase 4 — Streaming + previews
 
-`RangeReader` and `DriveResourceLoader` for the in-app player; `fetchPartialContents` for
-system-driven partial materialization; per-path behaviour documented and separately tested.
+**Done as far as this machine allows** (261 tests, 14 skipped, 0 failures;
+`xcodebuild -scheme CloudDisk` green). Four pieces:
+
+| Piece | File | What it does |
+| --- | --- | --- |
+| Aligned extent math + placement | `Provider/PartialExtent.swift` | Turns the system's minimal range into a legal aligned window and writes the served bytes at the offset that window names |
+| Ranged read to disk | `Drive/DriveService+Transfer.swift` | `downloadRange(fileID:offset:length:to:)` streams one `Range` into a file, 206 or a whole-object 200, and says which |
+| Partial materialization | `Provider/CloudDiskProviderCore.swift`, `Provider/CloudDiskFileProviderAgent.swift` | `fetchPartialContents` + `NSFileProviderPartialContentFetching`, reporting `retrievedRange` so only the fetched window counts as materialized |
+| Player streaming | `Streaming/DriveRangeReader.swift`, `Streaming/DriveAssetResourceLoader.swift` | One bounded read-ahead window (deliberately *not* a second content cache) behind an `AVAssetResourceLoaderDelegate` |
+
+| Area | Proven by |
+| --- | --- |
+| Extent math | minimal range widened to the requested alignment, a range past the end answered with the whole item, a zero-length request still producing one block, `alignment: 0` treated as "everything is aligned", a range that runs past EOF clamped to the file not the alignment, and only an extent that *ends* at the object allowed to stop mid-block |
+| Extent placement | an extent placed at its offset with the file reaching exactly the extent's end, an extent from byte 0 moved rather than copied, a short extent refused and leaving no file behind |
+| Provider partial fetch | a `bytes 4096-8191` request for `{4196, 500}` of a 1 MB object with **two** Drive calls and 4 KB of transfer, `retrievedRange` matching it; a whole-object window taking the streaming download instead of a range; a 200 answer to a range request reported from byte 0; an extent too short to cover the request refused; an extent that covers the request but stops mid-block refused; a Google-native doc exported whole; a strict-version request refused on metadata alone; a folder refused |
+| Range reads | sequential reads inside one window costing one request, a seek past the window fetching the window that contains it, a window at EOF clamped to what remains, a whole-object answer still read from the right place, a read past the end an error rather than empty bytes, a refused range reported with no partial window left |
+| Player integration | **a real WAV, played through AVFoundation with nothing but ranged reads**: `AVPlayerItem` reaches `readyToPlay` with the right 10 s duration, `AVAssetReader` decoding from 4 s yields the samples that live at 4 s with a window fetched around that offset, and a refused object fails the item instead of hanging it. Every media request recorded is a `bytes …-…` range and none carries more than one window |
+| Content type | the loader hands AVFoundation a **UTI**, because a MIME string outside Apple's table fails the asset with "Cannot Open" before a byte is read (verified with a standalone delegate probe: `audio/wav`, `audio/vnd.wave`, `audio/x-wav` and a nil type all refuse; the UTI loads) |
+
+**Defects found in this phase and fixed** — all five were live failure modes:
+1. `PartialExtent.aligned` read `length <= 0` as "the whole item", so any zero-length ask from the
+   system would have transferred a 20 GB archive to answer it. Now `span = max(0, length)` with the
+   whole-item answer reserved for a request that really does span the object.
+2. `MediaExtent.plan` clamped only *unspecified* lengths to a chunk, so a bounded request for the
+   whole object was served as one range — 114 688 bytes in the observed WAV run, 100 MB in the unit
+   test. A single read would have pulled an entire large file into memory. Both the clamp and the
+   delegate loop now bound every request.
+3. The loader passed Drive's MIME string to `AVAssetResourceLoaderDelegate`. AVFoundation refused the
+   asset outright. It now takes a `UTType` and declares its identifier.
+4. `DriveRangeReader` trapped (`SIGTRAP`, not a test failure) when a window arrived as a `Data` slice:
+   a slice keeps its parent's index space, so `subdata(in:)` read outside the window. The window is
+   normalized when stored.
+5. The partial fetch reported any extent that covered the request, including one that ended mid-block,
+   which is not a legal answer and would have let the system mark bytes materialized that never
+   arrived. Found while writing the refusal test — the first version of that test passed with the
+   guard deleted, which is why the covering-but-unaligned case is now a separate case.
+
+Defects 2, 4 and 5 were **mutation-verified**: removing the chunk clamp fails both the plan test and
+the playback window bound, removing the normalization crashed the suite, and `isAligned` neutered
+fails the mid-block test.
+
+**Not verified and not claimable here:** that Drive itself honours `Range` on a real object (the live
+smoke test that would prove it skips without credentials), that `fileproviderd` calls
+`fetchPartialContents` at the moments assumed, that Finder's Quick Look or a third-party player plays
+a streamed video, or that an MP4/H.264 object streams in this app — the playback test uses a WAV
+because this machine can synthesize one with known bytes at known offsets. Recorded in
+`docs/KNOWN_LIMITATIONS.md`.
+
 
 ## Phase 5 — Read/write
 

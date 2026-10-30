@@ -234,6 +234,201 @@ final class ProviderCoreTests: XCTestCase {
         XCTAssertEqual(harness.transport.requestCount, 1, "no media request for a folder")
     }
 
+    // MARK: Partial materialization
+
+    func testAPartialFetchTransfersOnlyTheAlignedWindowAroundTheRequest() async throws {
+        let payload = DriveTestEnvironment.deterministicBytes(1 << 20)
+        let harness = harness([
+            .json(remoteFile(size: payload.count)),
+            Self.rangeReply(Data(payload[4_096..<8_192]), from: 4_096, total: payload.count)
+        ])
+        defer { try? FileManager.default.removeItem(at: harness.scratch) }
+
+        let extent = try await harness.core.fetchPartialContents(
+            for: Self.fileIdentifier, requestedVersion: nil,
+            minimalRange: NSRange(location: 4_196, length: 500),
+            aligningTo: 4_096, strictVersioning: false, progress: Progress(totalUnitCount: 0))
+        defer { try? FileManager.default.removeItem(at: extent.url) }
+
+        XCTAssertEqual(harness.transport.requestCount, 2,
+                       "one kilobyte of a megabyte file must not transfer a megabyte")
+        XCTAssertEqual(harness.transport.header("Range", at: 1), "bytes 4096-8191",
+                       "the window is the aligned one, not the exact bytes asked for")
+        XCTAssertEqual(extent.retrievedRange, NSRange(location: 4_096, length: 4_096),
+                       "the system marks exactly what arrived as materialized")
+
+        let onDisk = try Data(contentsOf: extent.url)
+        XCTAssertEqual(onDisk.count, 8_192, "the file has to reach the extent's end")
+        XCTAssertEqual(onDisk.subdata(in: 4_096..<8_192), Data(payload[4_096..<8_192]),
+                       "and the fetched bytes have to sit at the offset the extent names")
+        XCTAssertEqual(extent.item.filename, "notes.txt")
+    }
+
+    func testAPartialRequestForTheWholeObjectTakesTheStreamingDownload() async throws {
+        let payload = DriveTestEnvironment.deterministicBytes(4_096)
+        // The whole-object path reads the metadata once to size the window and once inside the
+        // download, because the item handed back has to describe the bytes that just arrived.
+        let harness = harness([
+            .json(remoteFile(size: payload.count)),
+            .json(remoteFile(size: payload.count)),
+            StubTransport.Reply(statusCode: 200,
+                                headers: ["Content-Type": "application/octet-stream"],
+                                body: payload)
+        ])
+        defer { try? FileManager.default.removeItem(at: harness.scratch) }
+
+        let extent = try await harness.core.fetchPartialContents(
+            for: Self.fileIdentifier, requestedVersion: nil,
+            minimalRange: NSRange(location: 0, length: payload.count),
+            aligningTo: 4_096, strictVersioning: false, progress: Progress(totalUnitCount: 0))
+        defer { try? FileManager.default.removeItem(at: extent.url) }
+
+        XCTAssertNil(harness.transport.header("Range", at: 2),
+                     "a window that is the whole object is one request, not a ranged one")
+        XCTAssertEqual(extent.retrievedRange, NSRange(location: 0, length: payload.count))
+        XCTAssertEqual(try Data(contentsOf: extent.url), payload)
+    }
+
+    func testAWholeObjectAnsweredToARangeRequestIsReportedFromTheFirstByte() async throws {
+        let payload = DriveTestEnvironment.deterministicBytes(1 << 20)
+        // Drive ignores `Range` on some paths and answers 200 with the object: the bytes start at zero,
+        // so claiming an extent at 4096 would mark the wrong window as materialized.
+        let harness = harness([
+            .json(remoteFile(size: payload.count)),
+            StubTransport.Reply(statusCode: 200,
+                                headers: ["Content-Type": "application/octet-stream"],
+                                body: payload)
+        ])
+        defer { try? FileManager.default.removeItem(at: harness.scratch) }
+
+        let extent = try await harness.core.fetchPartialContents(
+            for: Self.fileIdentifier, requestedVersion: nil,
+            minimalRange: NSRange(location: 4_196, length: 500),
+            aligningTo: 4_096, strictVersioning: false, progress: Progress(totalUnitCount: 0))
+        defer { try? FileManager.default.removeItem(at: extent.url) }
+
+        XCTAssertEqual(extent.retrievedRange, NSRange(location: 0, length: payload.count))
+        XCTAssertEqual(try Data(contentsOf: extent.url), payload)
+    }
+
+    func testAnExtentTooShortToCoverTheRequestIsRefused() async throws {
+        let payload = DriveTestEnvironment.deterministicBytes(1 << 20)
+        let harness = harness([
+            .json(remoteFile(size: payload.count)),
+            // 100 bytes where the window asked for 4_096: the request runs to 4_696 and these stop
+            // at 4_196, so the rest of the file would be marked materialized without ever arriving.
+            Self.rangeReply(Data(payload[4_096..<4_196]), from: 4_096, total: payload.count)
+        ])
+        defer { try? FileManager.default.removeItem(at: harness.scratch) }
+
+        do {
+            _ = try await harness.core.fetchPartialContents(
+                for: Self.fileIdentifier, requestedVersion: nil,
+                minimalRange: NSRange(location: 4_196, length: 500),
+                aligningTo: 4_096, strictVersioning: false,
+                progress: Progress(totalUnitCount: 0))
+            XCTFail("a short answer would leave the file claiming bytes it does not have")
+        } catch let error as DriveError {
+            guard case .invalidResponse = error else {
+                return XCTFail("expected invalidResponse, got \(error)")
+            }
+        }
+        await assertRefusedExtent(harness)
+    }
+
+    func testAnExtentThatCoversTheRequestButStopsMidBlockIsRefused() async throws {
+        let payload = DriveTestEnvironment.deterministicBytes(1 << 20)
+        // Exactly the requested bytes and nothing more: it does cover the range, but a length that is
+        // not a multiple of the alignment is not an extent the system accepts.
+        let harness = harness([
+            .json(remoteFile(size: payload.count)),
+            Self.rangeReply(Data(payload[4_096..<4_696]), from: 4_096, total: payload.count)
+        ])
+        defer { try? FileManager.default.removeItem(at: harness.scratch) }
+
+        do {
+            _ = try await harness.core.fetchPartialContents(
+                for: Self.fileIdentifier, requestedVersion: nil,
+                minimalRange: NSRange(location: 4_196, length: 500),
+                aligningTo: 4_096, strictVersioning: false,
+                progress: Progress(totalUnitCount: 0))
+            XCTFail("an unaligned extent is answered with the bytes beside it, not the ones wanted")
+        } catch let error as DriveError {
+            guard case .invalidResponse = error else {
+                return XCTFail("expected invalidResponse, got \(error)")
+            }
+        }
+        await assertRefusedExtent(harness)
+    }
+
+    func testAGoogleDocumentHasNoSeekableMediaSoItIsExportedWhole() async throws {
+        let exported = Data("a doc exported as pdf".utf8)
+        let document = DriveJSON.file(id: Self.fileID, name: "Plan",
+                                      mimeType: "application/vnd.google-apps.document",
+                                      parents: [Self.folderID],
+                                      modifiedTime: "2026-10-29T10:00:00Z")
+        let harness = harness([.json(document), .json(document),
+                               StubTransport.Reply(statusCode: 200,
+                                                   headers: ["Content-Type": "application/pdf"],
+                                                   body: exported)])
+        defer { try? FileManager.default.removeItem(at: harness.scratch) }
+
+        let extent = try await harness.core.fetchPartialContents(
+            for: Self.fileIdentifier, requestedVersion: nil,
+            minimalRange: NSRange(location: 0, length: 100),
+            aligningTo: 4_096, strictVersioning: false, progress: Progress(totalUnitCount: 0))
+        defer { try? FileManager.default.removeItem(at: extent.url) }
+
+        XCTAssertNil(harness.transport.header("Range", at: 2),
+                     "the export endpoint ignores Range, so a partial read of a doc is a lie")
+        XCTAssertEqual(extent.retrievedRange, NSRange(location: 0, length: exported.count))
+        XCTAssertEqual(try Data(contentsOf: extent.url), exported)
+    }
+
+    func testAStrictVersionRequestIsRefusedBeforeAnyBytesMove() async throws {
+        // Drive holds rev-9 and the system will only accept rev-1: transferring rev-9's bytes first
+        // would burn the transfer and then have to be discarded.
+        let harness = harness([.json(remoteFile(size: 1 << 20, version: "rev-9"))])
+        defer { try? FileManager.default.removeItem(at: harness.scratch) }
+
+        let requested = ProviderIdentity.itemVersion(for: remoteDriveFile(version: "rev-1"))
+
+        do {
+            _ = try await harness.core.fetchPartialContents(
+                for: Self.fileIdentifier, requestedVersion: requested,
+                minimalRange: NSRange(location: 0, length: 1_024),
+                aligningTo: 4_096, strictVersioning: true, progress: Progress(totalUnitCount: 0))
+            XCTFail("strict versioning means the wrong bytes are no answer at all")
+        } catch let error as DriveError {
+            guard case .versionUnavailable = error else {
+                return XCTFail("expected versionUnavailable, got \(error)")
+            }
+            XCTAssertEqual(ProviderErrorMapper.bridge(error).code,
+                           NSFileProviderError.Code.versionNoLongerAvailable.rawValue)
+        }
+        XCTAssertEqual(harness.transport.requestCount, 1, "metadata only, no media request")
+        let activity = await harness.state.recentActivity()
+        XCTAssertEqual(activity.first?.outcome, .failure)
+    }
+
+    func testAFolderIsRefusedForAPartialFetchWithoutTouchingMedia() async throws {
+        let harness = harness([.json(DriveJSON.folder(id: Self.folderID, name: "Reports"))])
+        defer { try? FileManager.default.removeItem(at: harness.scratch) }
+
+        do {
+            _ = try await harness.core.fetchPartialContents(
+                for: Self.folderIdentifier, requestedVersion: nil,
+                minimalRange: NSRange(location: 0, length: 4_096),
+                aligningTo: 4_096, strictVersioning: false, progress: Progress(totalUnitCount: 0))
+            XCTFail("a folder has no extents")
+        } catch let error as DriveError {
+            guard case .unsupportedItem = error else {
+                return XCTFail("expected unsupportedItem, got \(error)")
+            }
+        }
+        XCTAssertEqual(harness.transport.requestCount, 1)
+    }
+
     // MARK: Create
 
     func testANewFolderBecomesOneDriveRequestAndAnItemInTheRightPlace() async throws {
@@ -1126,6 +1321,26 @@ final class ProviderCoreTests: XCTestCase {
     }
 
     // MARK: Helpers
+
+    /// A refused fetch leaves nothing behind and records the failure rather than a silent success.
+    private func assertRefusedExtent(_ harness: Harness,
+                                     file: StaticString = #filePath, line: UInt = #line) async {
+        if let scratch = harness.transport.calls.last?.writingResponseTo {
+            XCTAssertFalse(FileManager.default.fileExists(atPath: scratch.path),
+                           "the refused extent must not stay on disk", file: file, line: line)
+        }
+        let activity = await harness.state.recentActivity()
+        XCTAssertEqual(activity.first?.outcome, .failure, file: file, line: line)
+    }
+
+    /// A 206 for one window of an object, with the header Drive would have sent with it.
+    private static func rangeReply(_ bytes: Data, from offset: Int, total: Int) -> StubTransport.Reply {
+        StubTransport.Reply(
+            statusCode: 206,
+            headers: ["Content-Type": "application/octet-stream",
+                      "Content-Range": "bytes \(offset)-\(offset + bytes.count - 1)/\(total)"],
+            body: bytes)
+    }
 
     /// Finder asks for a folder's metadata before listing it, which leaves it in the ten-second
     /// cache. Container tests start from that state so the scripted replies are the list pages.

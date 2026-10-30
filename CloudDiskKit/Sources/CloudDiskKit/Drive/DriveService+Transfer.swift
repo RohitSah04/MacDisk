@@ -20,6 +20,28 @@ public struct DriveRangeData: Equatable, Sendable {
     public var endOffset: Int64 { offset + Int64(data.count) }
 }
 
+/// An extent written to disk by a ranged request, with the position it belongs at in the object.
+public struct DriveRangeExtent: Equatable, Sendable {
+    public let url: URL
+    public let offset: Int64
+    /// Bytes actually on disk, measured from the file rather than from the request.
+    public let byteCount: Int64
+    public let totalSize: Int64?
+    /// True when Drive answered 200 with the whole object instead of honouring `Range`.
+    public let servedWholeObject: Bool
+
+    public init(url: URL, offset: Int64, byteCount: Int64, totalSize: Int64?,
+                servedWholeObject: Bool) {
+        self.url = url
+        self.offset = offset
+        self.byteCount = byteCount
+        self.totalSize = totalSize
+        self.servedWholeObject = servedWholeObject
+    }
+
+    public var endOffset: Int64 { offset + byteCount }
+}
+
 /// Content transfer for Drive objects: full downloads, byte-range reads, exports, uploads.
 public extension DriveService {
 
@@ -74,22 +96,11 @@ public extension DriveService {
         guard offset >= 0, length > 0 else {
             throw DriveError.invalidResponse(detail: "invalid range \(offset)+\(length)")
         }
-        let lastByte = offset + Int64(length) - 1
-        let query: [URLQueryItem] = [
-            URLQueryItem(name: "alt", value: "media"),
-            URLQueryItem(name: "supportsAllDrives", value: "true"),
-            URLQueryItem(name: "acknowledgeAbuse", value: "true")
-        ]
-        let url = apiURL(path: "/drive/v3/files/\(encoded(fileID))", query: query)
-
-        let response = try await execute({ token in
-            var request = URLRequest(url: url)
-            request.httpMethod = "GET"
-            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-            request.setValue("bytes \(offset)-\(lastByte)", forHTTPHeaderField: "Range")
-            request.cachePolicy = .reloadIgnoringLocalCacheData
-            return request
-        }, extraAcceptedStatusCodes: [206])
+        let response = try await execute(Self.mediaRangeRequest(fileID: fileID, offset: offset,
+                                                                length: Int64(length),
+                                                                baseURL: apiURL(path: "/drive/v3/files/\(encoded(fileID))",
+                                                                                query: Self.mediaQuery)),
+                                         extraAcceptedStatusCodes: [206])
 
         guard let data = response.data else {
             throw DriveError.invalidResponse(detail: "range request returned no body")
@@ -100,6 +111,53 @@ public extension DriveService {
             totalSize: Self.totalSize(fromContentRange: response.value(forHeader: "Content-Range")),
             servedWholeObject: !response.isPartialContent && offset > 0
         )
+    }
+
+    /// Reads one byte range straight to a file, so a large extent never has to sit in memory.
+    ///
+    /// `destination` holds only the served bytes, starting at file offset 0; `offset` says where in
+    /// the object they belong. A server that ignored the `Range` header answers 200 with the whole
+    /// object, and then the offset is 0 — which is why the caller is handed the extent that actually
+    /// arrived instead of being trusted to reuse its own numbers.
+    func downloadRange(fileID: String, offset: Int64, length: Int64,
+                       to destination: URL) async throws -> DriveRangeExtent {
+        guard offset >= 0, length > 0 else {
+            throw DriveError.invalidResponse(detail: "invalid range \(offset)+\(length)")
+        }
+        let response = try await execute(Self.mediaRangeRequest(fileID: fileID, offset: offset,
+                                                                length: length,
+                                                                baseURL: apiURL(path: "/drive/v3/files/\(encoded(fileID))",
+                                                                                query: Self.mediaQuery)),
+                                         writingResponseTo: destination,
+                                         extraAcceptedStatusCodes: [206])
+
+        let byteCount = Self.byteCount(of: destination)
+        let servedWholeObject = !response.isPartialContent && offset > 0
+        return DriveRangeExtent(url: destination,
+                                offset: servedWholeObject ? 0 : offset,
+                                byteCount: byteCount,
+                                totalSize: Self.totalSize(fromContentRange: response.value(forHeader: "Content-Range")),
+                                servedWholeObject: servedWholeObject)
+    }
+
+    static let mediaQuery: [URLQueryItem] = [
+        URLQueryItem(name: "alt", value: "media"),
+        URLQueryItem(name: "supportsAllDrives", value: "true"),
+        // Drive refuses media for files flagged as scanned-abuse unless the caller accepts.
+        URLQueryItem(name: "acknowledgeAbuse", value: "true")
+    ]
+
+    static func mediaRangeRequest(fileID: String, offset: Int64, length: Int64,
+                                  baseURL: URL) -> @Sendable (String) -> URLRequest {
+        let lastByte = offset + length - 1
+        return { token in
+            var request = URLRequest(url: baseURL)
+            request.httpMethod = "GET"
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+            request.setValue("bytes \(offset)-\(lastByte)", forHTTPHeaderField: "Range")
+            request.cachePolicy = .reloadIgnoringLocalCacheData
+            return request
+        }
     }
 
     // MARK: Export

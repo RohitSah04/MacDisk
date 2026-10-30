@@ -14,6 +14,23 @@ public actor CloudDiskProviderCore {
         public let item: NSFileProviderItem
     }
 
+    /// One materialized extent: the file, the item it belongs to and the range actually filled in.
+    public struct FetchedExtent: Sendable {
+        public let url: URL
+        public let item: NSFileProviderItem
+        /// The extent to mark materialized. Everything else in the file stays dataless.
+        public let retrievedRange: NSRange
+        public let flags: NSFileProviderMaterializationFlags
+
+        public init(url: URL, item: NSFileProviderItem, retrievedRange: NSRange,
+                    flags: NSFileProviderMaterializationFlags = []) {
+            self.url = url
+            self.item = item
+            self.retrievedRange = retrievedRange
+            self.flags = flags
+        }
+    }
+
     public struct WriteOutcome: Sendable {
         public let item: NSFileProviderItem
         /// Fields the extension did not apply. The system retries them later, or stops sending them,
@@ -137,6 +154,96 @@ public actor CloudDiskProviderCore {
             return FetchedContent(url: destination, item: services.item(for: file, pinned: pinned))
         } catch {
             try? FileManager.default.removeItem(at: destination)
+            await reportFailure(.download, subject: driveID, error: error)
+            throw error
+        }
+    }
+
+    /// Materializes one byte extent instead of the whole object.
+    ///
+    /// The system hands over the smallest range it needs and an alignment it guarantees to be a power
+    /// of two; the answer may legally be a wider aligned window, and the extent that actually arrived
+    /// is what gets reported. Everything outside that extent stays dataless, so reading the first
+    /// kilobyte of a 20 GB archive costs one kilobyte of transfer.
+    ///
+    /// A Google Workspace document has no seekable media — its bytes only exist through the export
+    /// endpoint, which ignores `Range` — so such an item is exported whole rather than partially.
+    public func fetchPartialContents(for identifier: NSFileProviderItemIdentifier,
+                                     requestedVersion: NSFileProviderItemVersion?,
+                                     minimalRange: NSRange,
+                                     aligningTo alignment: Int,
+                                     strictVersioning: Bool,
+                                     progress: Progress) async throws -> FetchedExtent {
+        let driveID = try requireDriveID(identifier)
+        let destination = try services.temporaryFileURL()
+        let scratch = try services.temporaryFileURL()
+
+        do {
+            let metadata = try await services.drive.file(id: driveID)
+            if metadata.isFolder {
+                throw DriveError.unsupportedItem(detail: "\(driveID) is a folder and has no content")
+            }
+            // Checked before anything is transferred: with strict versioning the system discards any
+            // other version, so downloading the newer bytes first would only waste them.
+            if strictVersioning, let requestedVersion, !requestedVersion.contentVersion.isEmpty,
+               !ProviderIdentity.contentVersion(requestedVersion.contentVersion, matches: metadata) {
+                throw DriveError.versionUnavailable
+            }
+
+            let pinned = await services.state.isPinned(driveID)
+            let size = metadata.byteCount ?? 0
+            let window = PartialExtent.aligned(requesting: minimalRange,
+                                               alignment: alignment,
+                                               itemSize: size)
+
+            // Whole-object answers — including a Workspace export, whose size is unknown until it has
+            // been written — go through the streaming download so the bytes never enter memory and the
+            // metadata returned with them describes exactly what is on disk.
+            if metadata.isGoogleNative || window.coversWholeItem {
+                let file = try await services.drive.download(fileID: driveID, to: destination,
+                                                             progress: progress)
+                if strictVersioning, let requestedVersion, !requestedVersion.contentVersion.isEmpty,
+                   !ProviderIdentity.contentVersion(requestedVersion.contentVersion, matches: file) {
+                    try? FileManager.default.removeItem(at: destination)
+                    throw DriveError.versionUnavailable
+                }
+                await services.cache.store(file)
+                let written = DriveService.byteCount(of: destination)
+                try await services.state.record(.init(kind: .download, outcome: .success,
+                                                      subject: file.name))
+                return FetchedExtent(url: destination,
+                                     item: services.item(for: file, pinned: pinned),
+                                     retrievedRange: NSRange(location: 0, length: Int(written)))
+            }
+
+            let served = try await services.drive.downloadRange(fileID: driveID,
+                                                                offset: window.start,
+                                                                length: window.length,
+                                                                to: scratch)
+            let extent = PartialExtent(start: served.offset,
+                                       end: served.offset + served.byteCount,
+                                       itemSize: size)
+            // Reporting a narrower extent than the system asked for would let it mark bytes
+            // materialized that were never fetched, so a short answer is a failure, not a partial one.
+            guard extent.covers(minimalRange), extent.length > 0,
+                  extent.isAligned(to: alignment) else {
+                throw DriveError.invalidResponse(
+                    detail: "Drive served \(extent.start)..<\(extent.end) for the requested extent")
+            }
+            try ExtentFile.install(extent, from: served.url, to: destination)
+
+            progress.totalUnitCount = extent.length
+            progress.completedUnitCount = extent.length
+            await services.cache.store(metadata)
+            try await services.state.record(.init(kind: .download, outcome: .success,
+                                                  subject: metadata.name))
+            return FetchedExtent(url: destination,
+                                 item: services.item(for: metadata, pinned: pinned),
+                                 retrievedRange: NSRange(location: Int(extent.start),
+                                                         length: Int(extent.length)))
+        } catch {
+            try? FileManager.default.removeItem(at: destination)
+            try? FileManager.default.removeItem(at: scratch)
             await reportFailure(.download, subject: driveID, error: error)
             throw error
         }

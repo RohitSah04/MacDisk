@@ -125,9 +125,11 @@ The heartbeat is liveness only. It never carries a token, an account or a URL wi
   the system removes the dead replica.
 - `fetchPartialContents(for:version:request:minimalRange:aligningTo:…)` (macOS 12.3+) issues
   `Range: bytes=` requests, rounds the retrieved extent up to the requested alignment and reports
-  the actual `retrievedRange` with `NSFileProviderMaterializationFlagsKnownSparseRanges`. This is
-  what makes Finder previews, Quick Look and third-party apps pull only the bytes they need
-  instead of the whole file.
+  the actual `retrievedRange`. `NSFileProviderMaterializationFlags` is deliberately left empty: the
+  one flag available, `KnownSparseRanges`, tells the system to mark the *whole* file materialized
+  even where it holds holes, which is the opposite of what a partial fetch is for. This is what makes
+  Finder previews, Quick Look and third-party apps able to pull only the bytes they need instead of
+  the whole file — whether they actually do is the system's decision, not ours.
 - Capabilities come from Drive's `permissions`/`capabilities` for the authenticated user, not from a
   constant: read-only shares do not advertise `allowsWriting`/`allowsRenaming`/`allowsDeleting`.
 - Google Workspace native types are advertised as their exported flavour (`com.google.docs` style
@@ -164,15 +166,18 @@ a parallel cache: they are derived from File Provider's own answers (`isDownload
 
 Two distinct paths, because they are genuinely different:
 
-- **A. CloudDisk's player.** `AVPlayer` with a `fake-URL` (`clouddisk://<fileId>/<name>`) asset and a
-  `DriveResourceLoader` conforming to `AVAssetResourceLoaderDelegate`. It answers `dataRequest` with
-  byte-range GETs against Drive, serves only the requested window, keeps a bounded ring buffer, and
-  never holds the whole file in memory. Seeking is a new range request. This path does not create any
-  local file and does not consume disk.
+- **A. CloudDisk's player.** `AVPlayer` with a fake-URL (`clouddisk-drive://media/<fileId>`) asset and
+  `DriveAssetResourceLoader` conforming to `AVAssetResourceLoaderDelegate`. It answers `dataRequest`
+  with byte-range GETs against Drive, serves only the requested window, and holds exactly one bounded
+  read-ahead window in memory — not a cache of file content, because File Provider already owns
+  materialized bytes on the volume and a second store would double disk use and fight eviction.
+  Seeking is a new range request. This path creates no local file and consumes no disk. AVFoundation is
+  told the type as a **UTI**; a MIME string it does not recognize makes the asset fail with
+  "Cannot Open" before a single byte is read.
 - **B. Finder / Quick Look / third-party apps.** Opening a dataless item triggers the File Provider
-  materialization machinery; with `fetchPartialContents` implemented, reads pull extents on demand.
-  Whether a given app gets partial or full materialization is the system's decision, not ours, and
-  Quick Look is known to prefer a fully readable file for some formats. This is documented as a
+  materialization machinery; `fetchPartialContents` is implemented, so reads can pull extents on
+  demand. Whether a given app gets partial or full materialization is the system's decision, not ours,
+  and Quick Look is known to prefer a fully readable file for some formats. This is documented as a
   limitation rather than claimed as a feature.
 
 ## Testing strategy
