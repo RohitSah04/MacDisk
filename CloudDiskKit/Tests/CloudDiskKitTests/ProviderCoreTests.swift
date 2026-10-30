@@ -617,6 +617,41 @@ final class ProviderCoreTests: XCTestCase {
                        "the local bytes must reach Drive, not be discarded")
     }
 
+    func testAFailedReimportUploadIsRecordedAsTheLossItIs() async throws {
+        let directory = DriveTestEnvironment.scratchDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let edited = Data("edited offline".utf8)
+        let source = DriveTestEnvironment.writeFile(edited, named: "notes.txt", in: directory)
+
+        let harness = harness([
+            .json(DriveJSON.page(files: [remoteFile(size: 1_024)])),
+            .googleError(status: 403, reason: "insufficientFilePermissions",
+                         message: "The user does not have sufficient permissions.")
+        ])
+        defer { try? FileManager.default.removeItem(at: harness.scratch) }
+
+        let template = DriveFileProviderItem.make(from: DriveFile(
+            id: "pending00000000000000000000000008", name: "notes.txt",
+            mimeType: "text/plain", parents: [Self.folderID]))
+
+        do {
+            _ = try await harness.core.create(basedOn: template, fields: [.contents], contents: source,
+                                              options: [.mayAlreadyExist],
+                                              progress: Progress(totalUnitCount: 100))
+            XCTFail("a replayed local edit Drive refused has to surface")
+        } catch let error as CloudDiskProviderCore.CoreError {
+            guard case .writeNotAllowed = error else {
+                return XCTFail("expected writeNotAllowed, got \(error)")
+            }
+        }
+
+        let activity = await harness.state.recentActivity()
+        let failure = try XCTUnwrap(activity.first { $0.outcome == .failure })
+        XCTAssertEqual(failure.kind, .upload)
+        XCTAssertEqual(failure.subject, "notes.txt",
+                       "the replayed file is the user's own edit; the log has to name it")
+    }
+
     func testImportFinishingEstablishesTheChangesCursorExactlyOnce() async throws {
         let harness = harness([
             .json(["kind": "drive#startPageToken", "startPageToken": "AAAAAAAAMWQ"])
@@ -681,27 +716,39 @@ final class ProviderCoreTests: XCTestCase {
         XCTAssertEqual(harness.transport.queryItems(at: 1)["enforceSingleParent"], "true")
     }
 
-    func testAGoogleDocumentReportsEveryRequestedFieldAsUnappliedInsteadOfFailing() async throws {
-        let harness = harness([
-            .json(DriveJSON.file(id: Self.fileID, name: "Roadmap",
-                                 mimeType: "application/vnd.google-apps.document",
-                                 version: "rev-1", parents: [Self.folderID],
-                                 exportLinks: ["application/pdf": "https://export/1"]))
-        ])
+    func testADocumentRenameLandsAndOnlyItsContentIsReportedUnapplied() async throws {
+        let document = DriveJSON.file(id: Self.fileID, name: "Roadmap",
+                                      mimeType: "application/vnd.google-apps.document",
+                                      version: "rev-1", parents: [Self.folderID],
+                                      exportLinks: ["application/pdf": "https://export/1"])
+        let renamed = DriveJSON.file(id: Self.fileID, name: "Roadmap v2",
+                                     mimeType: "application/vnd.google-apps.document",
+                                     version: "rev-1", parents: [Self.folderID],
+                                     exportLinks: ["application/pdf": "https://export/1"])
+        let directory = DriveTestEnvironment.scratchDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let source = DriveTestEnvironment.writeFile(Data("typed into the Finder copy".utf8),
+                                                   named: "Roadmap", in: directory)
+
+        let harness = harness([.json(document), .json(renamed)])
         defer { try? FileManager.default.removeItem(at: harness.scratch) }
 
         let edited = DriveFileProviderItem.make(from: DriveFile(
-            id: Self.fileID, name: "Roadmap edited",
+            id: Self.fileID, name: "Roadmap v2",
             mimeType: "application/vnd.google-apps.document", parents: [Self.folderID]))
-        let fields: NSFileProviderItemFields = [.filename, .contents]
-        let outcome = try await harness.core.modify(edited,
-                                                   baseVersion: ProviderIdentity.itemVersion(for: remoteDriveFile()),
-                                                   changedFields: fields, contents: nil,
-                                                   options: [], progress: Progress(totalUnitCount: 100))
+        let outcome = try await harness.core.modify(
+            edited, baseVersion: ProviderIdentity.itemVersion(for: remoteDriveFile()),
+            changedFields: [.filename, .contents], contents: source, options: [],
+            progress: Progress(totalUnitCount: 100))
 
-        XCTAssertEqual(outcome.pendingFields, fields,
-                       "an unsupported write must be reported, not silently dropped")
-        XCTAssertEqual(harness.transport.requestCount, 1, "no upload attempt for a document")
+        XCTAssertEqual(harness.transport.method(at: 1), "PATCH")
+        XCTAssertEqual(harness.transport.jsonObject(at: 1)["name"] as? String, "Roadmap v2",
+                       "a document's name is ordinary metadata; refusing it loses a rename Drive can do")
+        XCTAssertFalse(harness.transport.requests().contains { $0.url?.path.hasPrefix("/upload/") == true },
+                       "Drive has no upload path for a document, so its bytes must never be pushed")
+        XCTAssertEqual(outcome.pendingFields, [.contents],
+                       "the unsupported half of the write is reported, not silently dropped")
+        XCTAssertEqual(outcome.item.filename, "Roadmap v2")
     }
 
     func testContentThatMatchesTheKnownVersionIsUploadedInPlace() async throws {
@@ -795,6 +842,295 @@ final class ProviderCoreTests: XCTestCase {
             progress: Progress(totalUnitCount: 100))
         XCTAssertTrue(outcome.pendingFields.contains(.contents),
                       "the field stays pending so the system can retry rather than believe it synced")
+    }
+
+    // MARK: Write permissions
+
+    /// The same object with Google's own permission flags attached.
+    private func remoteFile(with capabilities: [String: Any]?, name: String = "notes.txt",
+                            version: String = "rev-1", trashed: Bool? = nil) -> [String: Any] {
+        DriveJSON.file(id: Self.fileID, name: name, mimeType: "text/plain", size: 1_024,
+                       version: version, parents: [Self.folderID], trashed: trashed,
+                       modifiedTime: "2026-10-29T10:00:00Z", capabilities: capabilities)
+    }
+
+    private func writeSource(_ bytes: String = "edited locally") -> (directory: URL, url: URL) {
+        let directory = DriveTestEnvironment.scratchDirectory()
+        return (directory, DriveTestEnvironment.writeFile(Data(bytes.utf8),
+                                                          named: "notes.txt", in: directory))
+    }
+
+    /// A refusal the extension raised itself: the system must see a write-permission failure, the
+    /// request that would have been refused must not have been made, and the Activity log must hold
+    /// the sentence the user saw.
+    private func assertWriteRefused(_ harness: Harness, kind: ProviderState.ActivityEvent.Kind,
+                                   requests: Int = 1, detail: String? = nil,
+                                   file: StaticString = #filePath, line: UInt = #line) async {
+        XCTAssertEqual(harness.transport.requestCount, requests,
+                       "only the requests named here happened; the refused write must not have been sent",
+                       file: file, line: line)
+        let activity = await harness.state.recentActivity()
+        let failure = activity.first { $0.outcome == .failure }
+        XCTAssertEqual(failure?.kind, kind, file: file, line: line)
+        if let detail {
+            let recorded = failure?.detail ?? ""
+            XCTAssertTrue(recorded.contains(detail),
+                          "activity said “\(recorded)”, expected “\(detail)”",
+                          file: file, line: line)
+        }
+    }
+
+    private func assertWriteNotAllowed(_ error: Error, contains phrase: String,
+                                       file: StaticString = #filePath, line: UInt = #line) {
+        guard case CloudDiskProviderCore.CoreError.writeNotAllowed(let detail) = error else {
+            return XCTFail("expected writeNotAllowed, got \(error)", file: file, line: line)
+        }
+        XCTAssertTrue(detail.contains(phrase), "said “\(detail)”, expected “\(phrase)”",
+                      file: file, line: line)
+        let bridged = ProviderErrorMapper.bridge(error) as NSError
+        XCTAssertEqual(bridged.domain, NSCocoaErrorDomain, file: file, line: line)
+        XCTAssertEqual(bridged.code, CocoaError.Code.fileWriteNoPermission.rawValue,
+                       "a denied save has to be reported as a write failure or Finder blames the wrong thing",
+                       file: file, line: line)
+    }
+
+    func testAContentWriteOnAReadOnlyItemIsRefusedWithoutUploading() async throws {
+        let current = DriveFile(id: Self.fileID, name: "notes.txt", mimeType: "text/plain",
+                                size: "1024", version: "rev-1", parents: [Self.folderID],
+                                capabilities: DriveCapabilities(canEdit: false))
+        let source = writeSource()
+        defer { try? FileManager.default.removeItem(at: source.directory) }
+
+        let harness = harness([.json(remoteFile(with: ["canEdit": false]))])
+        defer { try? FileManager.default.removeItem(at: harness.scratch) }
+
+        do {
+            _ = try await harness.core.modify(DriveFileProviderItem.make(from: current),
+                                              baseVersion: ProviderIdentity.itemVersion(for: current),
+                                              changedFields: [.contents], contents: source.url,
+                                              options: [], progress: Progress(totalUnitCount: 100))
+            XCTFail("a viewer's edit must not be uploaded over the owner's copy")
+        } catch {
+            assertWriteNotAllowed(error, contains: "only lets you read")
+        }
+        await assertWriteRefused(harness, kind: .upload, detail: "only lets you read")
+    }
+
+    func testARenameOfAReadOnlyItemIsRefused() async throws {
+        let remote = DriveFile(id: Self.fileID, name: "notes.txt", mimeType: "text/plain",
+                               size: "1024", version: "rev-1", parents: [Self.folderID],
+                               capabilities: DriveCapabilities(canEdit: false))
+        let edited = DriveFile(id: Self.fileID, name: "my notes.txt", mimeType: "text/plain",
+                               size: "1024", version: "rev-1", parents: [Self.folderID])
+
+        let harness = harness([.json(remoteFile(with: ["canEdit": false]))])
+        defer { try? FileManager.default.removeItem(at: harness.scratch) }
+
+        do {
+            _ = try await harness.core.modify(DriveFileProviderItem.make(from: edited),
+                                              baseVersion: ProviderIdentity.itemVersion(for: remote),
+                                              changedFields: [.filename], contents: nil,
+                                              options: [], progress: Progress(totalUnitCount: 100))
+            XCTFail("Drive would reject the PATCH as well")
+        } catch {
+            assertWriteNotAllowed(error, contains: "only lets you read")
+        }
+        await assertWriteRefused(harness, kind: .rename)
+    }
+
+    func testAMoveOfAnItemThatCannotLeaveItsFolderIsRefused() async throws {
+        let other = "other0000000000000000000000000001"
+        let remote = DriveFile(id: Self.fileID, name: "notes.txt", mimeType: "text/plain",
+                               size: "1024", version: "rev-1", parents: [Self.folderID],
+                               capabilities: DriveCapabilities(canEdit: true,
+                                                                    canMoveItemOutOfWorld: false))
+        let moved = DriveFile(id: Self.fileID, name: "notes.txt", mimeType: "text/plain",
+                              size: "1024", version: "rev-1", parents: [other])
+
+        let harness = harness([.json(remoteFile(with: ["canEdit": true,
+                                                      "canMoveItemOutOfWorld": false]))])
+        defer { try? FileManager.default.removeItem(at: harness.scratch) }
+
+        do {
+            _ = try await harness.core.modify(DriveFileProviderItem.make(from: moved),
+                                              baseVersion: ProviderIdentity.itemVersion(for: remote),
+                                              changedFields: [.parentItemIdentifier], contents: nil,
+                                              options: [], progress: Progress(totalUnitCount: 100))
+            XCTFail("someone else's folder cannot be emptied by dragging out of it")
+        } catch {
+            assertWriteNotAllowed(error, contains: "will not let it leave")
+        }
+        await assertWriteRefused(harness, kind: .move)
+    }
+
+    func testATrashedItemRefusesAWriteEvenWhenItIsMarkedEditable() async throws {
+        let remote = DriveFile(id: Self.fileID, name: "notes.txt", mimeType: "text/plain",
+                               size: "1024", version: "rev-1", parents: [Self.folderID],
+                               trashed: true,
+                               capabilities: DriveCapabilities(canEdit: true))
+        let edited = DriveFile(id: Self.fileID, name: "notes.txt", mimeType: "text/plain",
+                               size: "1024", version: "rev-1", parents: [Self.folderID],
+                               trashed: true)
+
+        let harness = harness([.json(remoteFile(with: ["canEdit": true], trashed: true))])
+        defer { try? FileManager.default.removeItem(at: harness.scratch) }
+
+        do {
+            _ = try await harness.core.modify(DriveFileProviderItem.make(from: edited),
+                                              baseVersion: ProviderIdentity.itemVersion(for: remote),
+                                              changedFields: [.parentItemIdentifier], contents: nil,
+                                              options: [], progress: Progress(totalUnitCount: 100))
+            XCTFail("un-trashing by moving is not a Drive operation CloudDisk can perform")
+        } catch {
+            assertWriteNotAllowed(error, contains: "trash")
+        }
+        await assertWriteRefused(harness, kind: .move, detail: "trash")
+    }
+
+    func testACapabilityGoogleDidNotSendIsNotTreatedAsARefusal() async throws {
+        let current = remoteDriveFile()
+        let source = writeSource()
+        defer { try? FileManager.default.removeItem(at: source.directory) }
+
+        // Drive omits capability fields for some shared items. Guessing "forbidden" from an absent
+        // flag would make an object the user can plainly edit uneditable, so the write goes through
+        // and Google decides.
+        let harness = harness([
+            .json(remoteFile(with: ["canDownload": true])),
+            StubTransport.Reply(statusCode: 200,
+                                headers: ["Location": "https://example.com/resumable/9"], body: nil),
+            .json(DriveJSON.file(id: Self.fileID, name: "notes.txt",
+                                 size: Int64(Data("edited locally".utf8).count), version: "rev-2",
+                                 parents: [Self.folderID]))
+        ])
+        defer { try? FileManager.default.removeItem(at: harness.scratch) }
+
+        let outcome = try await harness.core.modify(DriveFileProviderItem.make(from: current),
+                                                   baseVersion: ProviderIdentity.itemVersion(for: current),
+                                                   changedFields: [.contents], contents: source.url,
+                                                   options: [], progress: Progress(totalUnitCount: 100))
+        XCTAssertEqual(harness.transport.header("X-HTTP-Method-Override", at: 1), "PATCH")
+        XCTAssertEqual(outcome.pendingFields, [])
+    }
+
+    func testAWriteGoogleRefusesMidFlightIsReportedAsAWriteFailure() async throws {
+        let current = remoteDriveFile()
+        let source = writeSource()
+        defer { try? FileManager.default.removeItem(at: source.directory) }
+
+        let harness = harness([
+            .json(remoteFile(with: nil)),
+            .googleError(status: 403, reason: "insufficientFilePermissions",
+                         message: "The user does not have sufficient permissions.")
+        ])
+        defer { try? FileManager.default.removeItem(at: harness.scratch) }
+
+        do {
+            _ = try await harness.core.modify(DriveFileProviderItem.make(from: current),
+                                              baseVersion: ProviderIdentity.itemVersion(for: current),
+                                              changedFields: [.contents], contents: source.url,
+                                              options: [], progress: Progress(totalUnitCount: 100))
+            XCTFail("a 403 has to surface, not be swallowed")
+        } catch {
+            assertWriteNotAllowed(error, contains: "sufficient permissions")
+        }
+        await assertWriteRefused(harness, kind: .upload, requests: 2)
+    }
+
+    func testNothingIsFiledIntoAFolderThatRejectsChildren() async throws {
+        let harness = harness()
+        defer { try? FileManager.default.removeItem(at: harness.scratch) }
+        await harness.services.cache.store(DriveFile(
+            id: Self.folderID, name: "Team Shared", mimeType: DriveFile.folderMimeType,
+            parents: ["root"], capabilities: DriveCapabilities(canAddChildren: false)))
+
+        let template = DriveFileProviderItem.make(from: DriveFile(
+            id: "pending00000000000000000000000006", name: "notes.txt",
+            mimeType: "text/plain", parents: [Self.folderID]))
+
+        do {
+            _ = try await harness.core.create(basedOn: template, fields: [.contents], contents: nil,
+                                              options: [], progress: Progress(totalUnitCount: 100))
+            XCTFail("a read-only folder cannot receive the file")
+        } catch let error as CloudDiskProviderCore.CoreError {
+            guard case .writeNotAllowed(let detail) = error else {
+                return XCTFail("expected writeNotAllowed, got \(error)")
+            }
+            XCTAssertTrue(detail.contains("add files to it"), "said “\(detail)”")
+        }
+        XCTAssertEqual(harness.transport.requestCount, 0,
+                       "the folder was listed moments ago; its flags are already in memory")
+    }
+
+    func testNothingIsFiledIntoAFolderThatIsInTheTrash() async throws {
+        let harness = harness()
+        defer { try? FileManager.default.removeItem(at: harness.scratch) }
+        await harness.services.cache.store(DriveFile(
+            id: Self.folderID, name: "Old Stuff", mimeType: DriveFile.folderMimeType,
+            trashed: true, capabilities: DriveCapabilities(canAddChildren: true)))
+
+        let template = DriveFileProviderItem.make(from: DriveFile(
+            id: "pending00000000000000000000000007", name: "notes.txt",
+            mimeType: "text/plain", parents: [Self.folderID]))
+
+        do {
+            _ = try await harness.core.create(basedOn: template, fields: [.contents], contents: nil,
+                                              options: [], progress: Progress(totalUnitCount: 100))
+            XCTFail("Drive has no way to file an object into the trash")
+        } catch let error as CloudDiskProviderCore.CoreError {
+            guard case .writeNotAllowed(let detail) = error else {
+                return XCTFail("expected writeNotAllowed, got \(error)")
+            }
+            XCTAssertTrue(detail.contains("trash"), "said “\(detail)”")
+        }
+        XCTAssertEqual(harness.transport.requestCount, 0)
+    }
+
+    func testAMoveIntoAFolderThatRejectsChildrenIsRefusedBeforeThePatch() async throws {
+        let locked = "other0000000000000000000000000001"
+        let current = remoteDriveFile()
+        let moved = DriveFile(id: Self.fileID, name: "notes.txt", mimeType: "text/plain",
+                              size: "1024", version: "rev-1", parents: [locked])
+
+        let harness = harness([.json(remoteFile(with: ["canEdit": true]))])
+        defer { try? FileManager.default.removeItem(at: harness.scratch) }
+        await harness.services.cache.store(DriveFile(
+            id: locked, name: "Read Only", mimeType: DriveFile.folderMimeType,
+            capabilities: DriveCapabilities(canAddChildren: false)))
+
+        do {
+            _ = try await harness.core.modify(DriveFileProviderItem.make(from: moved),
+                                              baseVersion: ProviderIdentity.itemVersion(for: current),
+                                              changedFields: [.parentItemIdentifier], contents: nil,
+                                              options: [], progress: Progress(totalUnitCount: 100))
+            XCTFail("the system checks the item's own rights, never the destination's")
+        } catch let error as CloudDiskProviderCore.CoreError {
+            guard case .writeNotAllowed(let detail) = error else {
+                return XCTFail("expected writeNotAllowed, got \(error)")
+            }
+            XCTAssertTrue(detail.contains("add files to it"), "said “\(detail)”")
+        }
+        XCTAssertEqual(harness.transport.requestCount, 1, "no PATCH for a move that cannot land")
+    }
+
+    func testADeleteIsLoggedWithTheNameTheUserRecognises() async throws {
+        let harness = harness([
+            .json(DriveJSON.emptyPage),
+            .json(["id": Self.fileID, "trashed": false]),
+            .json(remoteFile(trashed: true))
+        ])
+        defer { try? FileManager.default.removeItem(at: harness.scratch) }
+        await harness.services.cache.store(remoteDriveFile())
+
+        try await harness.core.delete(identifier: Self.fileIdentifier,
+                                      baseVersion: ProviderIdentity.itemVersion(for: remoteDriveFile()),
+                                      options: [])
+
+        let activity = await harness.state.recentActivity()
+        let record = try XCTUnwrap(activity.first { $0.kind == .delete })
+        XCTAssertEqual(record.subject, "notes.txt",
+                       "a Drive id in the activity list is not something the user can read")
+        XCTAssertEqual(record.outcome, .success)
     }
 
     // MARK: Delete

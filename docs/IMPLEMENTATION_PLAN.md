@@ -190,8 +190,70 @@ because this machine can synthesize one with known bytes at known offsets. Recor
 
 ## Phase 5 — Read/write
 
-`createItem`/`modifyItem`/`deleteItem` doing real API work with capability enforcement, conflict
-detection against `baseVersion`, and an operation/activity record for failures and retries.
+**Done as far as this machine allows** (284 tests, 14 skipped, 0 failures;
+`xcodebuild -scheme CloudDisk` green). The three write methods were already doing real API work from
+Phase 3 (`create`/`modify`/`delete`, conflict detection against `baseVersion`, resumable uploads);
+what this phase added is the permission layer that was missing between them and Google.
+
+| Piece | File | What it does |
+| --- | --- | --- |
+| Write decision table | `Provider/WritePolicy.swift` | Reads Drive's `capabilities` flags and answers one question: is there *positive evidence* this write cannot land? An absent flag is an unknown, not a ban |
+| Source-side enforcement | `Provider/CloudDiskProviderCore.swift` | `modify` judges the metadata it fetched a moment before the write, not the copy the system enumerated five minutes ago |
+| Container enforcement | same, `create` + the move branch of `modify` | A destination that rejects children, or that is itself in the trash, fails with zero requests spent — the metadata cache already holds the answer from the listing that put it on screen |
+| Delete permission | `Drive/DriveService.swift` | The `files.get` that already decides *trash vs. permanent* now also asks `capabilities(canTrash,canEdit)`, so a delete Google will refuse costs one round trip instead of two |
+| Honest error codes | `Provider/ProviderErrorMapper.swift`, core | New `CoreError.writeNotAllowed` bridged to `NSCocoaErrorDomain` / `fileWriteNoPermission`; a 403 that arrives mid-write is re-labelled as a write failure |
+| Complete activity record | core | Every write failure — upload, rename, move, delete, reimport replay — lands in the activity log with the user's own sentence as the detail, and deletes are logged with the filename rather than the Drive id |
+
+| Area | Proven by |
+| --- | --- |
+| Write rules (8 pure cases) | field sets that write nothing are never judged on Drive's flags; `canEdit: false` refusing content, rename, move and all three together; `canMoveItemOutOfWorld: false` refusing *only* the move; the trash flag outranking an editable permission; four shapes of missing permission data all passing; both container rules; every sentence naming the item and none leaking an internal id |
+| Provider write checks | a read-only item's edit refused after one request with no upload; a rename refused; a move refused; a drag out of the Trash refused; capability data absent → the upload still runs; Google's own 403 during an upload re-labelled with the server's sentence; create into a folder that rejects children, and into one that is trashed, costing **0** requests; a move into a read-only folder refused before the PATCH; a delete recorded as "notes.txt" |
+| Drive delete permission | the trash-state request asks for the flags; `canTrash: false` refused with one request and neither a PATCH nor a DELETE; a permanent delete of an already-trashed object never blocked by an absent flag; no capability object at all → the write goes to Google; `canEdit: false` blocking a delete when `canTrash` is absent |
+| Document metadata | a Google Doc's rename lands as one PATCH while its content stays pending and **no** `/upload/` request is made |
+| Conflict handling (unchanged, re-verified) | the version comparison against `baseVersion`, the two-file resolution with its own activity line, `.failOnConflict` on macOS 26+, an acknowledged-but-empty content ask |
+
+**Defects and asymmetries found in this phase and fixed** — the first was a live user-visible failure,
+the rest are correctness or legibility:
+1. `modify` returned *every* requested field as pending for a Google Workspace document, while
+   `DriveFileProviderItem.capabilities` advertised `.allowsRenaming` and `.allowsReparenting` for it
+   (both come from `canEdit`). A rename of a Google Doc in Finder therefore never landed and never
+   failed — it silently reverted. Name and folder are ordinary Drive metadata, so they are written now
+   and only `.contents` stays pending.
+2. A denied save was reported with `fileReadNoPermission`, the code for "you cannot open this", because
+   `DriveError.permissionDenied` had one mapping for both directions. Writes now raise
+   `writeNotAllowed` → `fileWriteNoPermission`, whether the local check caught it or Google did.
+3. The reimport replay of a local edit that survived a restart was the only write whose failure
+   produced no activity record at all: the error reached the system, and the user's Activity list
+   showed nothing.
+4. `delete` recorded the raw Drive id as the activity subject, and refused-or-allowed was decided by
+   Google's 403 alone even though the object's flags arrive in the very request that decides
+   trash-versus-permanent.
+5. `modify` compared the item's raw `filename` against Drive's name but sent the *materialized* one, so
+   a name that APFS cleaning changes would re-PATCH a value the object already had. A tightening rather
+   than a reachable defect for anything CloudDisk minted — those names arrive already materialized — and
+   it is not mutation-verified.
+
+Every guard this phase added is **mutation-verified**, in six runs: neutering `WritePolicy.refusal`
+fails 10 tests and sends the refused writes to Drive — the stub runs out of replies, which is the proof
+the request really would have gone out; turning "unknown" into "forbidden" fails 22 tests including
+every pre-existing write test, which is the rule that keeps an ordinary edit working; and removing the
+403 relabel, the `mayTrash` guard, either container check, or the delete-name and reimport records each
+fails exactly the tests named above.
+
+**Not verified and not claimable here.** That `fileproviderd` ever asks CloudDisk to write an item the
+listing said was read-only — these checks are a backstop for a permission that changed after
+enumeration, and on a signed-in Mac the system usually honours the advertised capabilities, so the new
+refusals may never fire in practice; the tests prove the code path, not Finder's route into it. Google's
+exact `capabilities` payload per share type (viewer, commenter, shared-drive organizer) — every rule
+acts only on an explicit `false`, which is the safe shape but is not the same as having seen the real
+responses. A Workspace-document rename being accepted by Drive in production. Server-side copy:
+File Provider has no clone option in `createItem`, so a Finder copy of a dataless item materializes and
+re-uploads; `DriveService.copy` is the tested `files.copy` primitive for CloudDisk's own browser, not a
+path the provider uses. And the offline write queue: this is File Provider's journal, not a CloudDisk
+structure — the replication engine persists the pending change, survives an extension restart and
+replays it into `createItem` with `.mayAlreadyExist` (which is what the reimport matching exists for),
+so no competing queue was built. Killing `fileproviderd` mid-write to watch that replay cannot be done
+without a signed-in domain and is recorded as unverified.
 
 ## Phase 6 — Cache and offline
 

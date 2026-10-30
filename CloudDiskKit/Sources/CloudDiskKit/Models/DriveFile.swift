@@ -156,7 +156,8 @@ public struct DriveCapabilities: Decodable, Equatable, Sendable {
     public let canDeleteChildren: Bool?
 
     public init(canEdit: Bool? = nil, canDownload: Bool? = nil, canTrash: Bool? = nil,
-                canCopy: Bool? = nil, canAddChildren: Bool? = nil, canShare: Bool? = nil) {
+                canCopy: Bool? = nil, canAddChildren: Bool? = nil, canShare: Bool? = nil,
+                canMoveItemOutOfWorld: Bool? = nil) {
         self.canEdit = canEdit
         self.canDownload = canDownload
         self.canTrash = canTrash
@@ -164,7 +165,7 @@ public struct DriveCapabilities: Decodable, Equatable, Sendable {
         self.canAddChildren = canAddChildren
         self.canShare = canShare
         self.canRemoveChildren = nil
-        self.canMoveItemOutOfWorld = nil
+        self.canMoveItemOutOfWorld = canMoveItemOutOfWorld
         self.canUpdate = nil
         self.canDeleteChildren = nil
     }

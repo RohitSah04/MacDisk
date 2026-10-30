@@ -309,8 +309,17 @@ public struct DriveService: Sendable {
     /// "Move to Trash" reaches. The trashed flag is checked rather than assumed, because an item the
     /// user deletes a second time — from CloudDisk's Trash folder — is exactly the case where
     /// permanent removal is what was asked for.
+    ///
+    /// The same request carries the account's delete permission, so an object Google will not let this
+    /// user trash is refused here instead of twenty milliseconds later by the write itself. A permanent
+    /// delete is not checked: Google reports no field for it, and refusing the ones that are missing
+    /// would make the Trash impossible to empty.
     public func delete(fileID: String) async throws {
         let state = try await trashState(of: fileID)
+        if !state.isTrashed, state.mayTrash == false {
+            throw DriveError.permissionDenied(
+                detail: "Google Drive does not let you move this file to the trash.")
+        }
         if state.isTrashed {
             try await deletePermanently(fileID: fileID)
         } else {
@@ -318,18 +327,27 @@ public struct DriveService: Sendable {
         }
     }
 
-    /// The delete decision needs two fields, and `DriveFile` cannot be decoded from two fields:
-    /// its `name` and `mimeType` are required. Asking Drive for less than the model needs would
-    /// make every delete fail, so a purpose-built resource is decoded instead.
+    /// The three fields a delete decision is made from, and nothing else.
+    ///
+    /// `DriveFile` cannot be decoded from them — its `name` and `mimeType` are required — so a
+    /// purpose-built resource is used rather than asking Drive for the whole object on every delete.
     private struct TrashState: Decodable {
         let id: String
         let trashed: Bool?
+        let capabilities: DriveCapabilities?
+
         var isTrashed: Bool { trashed ?? false }
+
+        /// nil when Google sent no permission data, which is not the same answer as `false`.
+        var mayTrash: Bool? {
+            guard let capabilities else { return nil }
+            return capabilities.canTrash ?? capabilities.canEdit
+        }
     }
 
     private func trashState(of fileID: String) async throws -> TrashState {
         let query: [URLQueryItem] = [
-            URLQueryItem(name: "fields", value: "id,trashed"),
+            URLQueryItem(name: "fields", value: "id,trashed,capabilities(canTrash,canEdit)"),
             URLQueryItem(name: "supportsAllDrives", value: "true")
         ]
         let response = try await execute(jsonRequest(

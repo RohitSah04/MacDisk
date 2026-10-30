@@ -1015,11 +1015,74 @@ final class DriveServiceTests: XCTestCase {
 
         try await env.service.delete(fileID: fileID)
         XCTAssertEqual(transport.method(at: 0), "GET")
-        XCTAssertEqual(transport.queryItems(at: 0)["fields"], "id,trashed")
+        XCTAssertEqual(transport.queryItems(at: 0)["fields"], "id,trashed,capabilities(canTrash,canEdit)",
+                       "the request that decides trash-versus-permanent also asks for the permission, "
+                       + "so a delete Google will refuse costs one round trip instead of two")
         XCTAssertEqual(transport.method(at: 1), "PATCH")
         XCTAssertEqual(transport.jsonObject(at: 1)["trashed"] as? Bool, true)
         XCTAssertFalse(transport.requests().contains { $0.httpMethod == "DELETE" },
                        "a first delete must be recoverable")
+    }
+
+    func testADeleteGoogleWillNotAllowIsRefusedBeforeTheWrite() async throws {
+        let transport = StubTransport(script: [
+            .json(["id": fileID, "trashed": false,
+                   "capabilities": ["canTrash": false, "canEdit": false]])
+        ])
+        let env = DriveTestEnvironment.make(transport: transport)
+
+        do {
+            try await env.service.delete(fileID: fileID)
+            XCTFail("an object this account may not trash has to fail, not look deleted")
+        } catch let error as DriveError {
+            guard case .permissionDenied = error else {
+                return XCTFail("expected permissionDenied, got \(error)")
+            }
+        }
+        XCTAssertEqual(transport.requestCount, 1, "the refusal is the whole conversation")
+        XCTAssertFalse(transport.requests().contains { $0.httpMethod == "PATCH" })
+    }
+
+    func testAPermanentDeleteIsNotBlockedByAnAbsentTrashPermission() async throws {
+        let transport = StubTransport(script: [
+            .json(["id": fileID, "trashed": true, "capabilities": ["canTrash": false]]),
+            .noContent
+        ])
+        let env = DriveTestEnvironment.make(transport: transport)
+
+        // Google reports no field for "may remove this for good", so refusing on a false `canTrash`
+        // here would leave the user unable to empty the trash at all.
+        try await env.service.delete(fileID: fileID)
+        XCTAssertEqual(transport.method(at: 1), "DELETE")
+    }
+
+    func testADeleteWithNoPermissionDataAtAllStillReachesGoogle() async throws {
+        let transport = StubTransport(script: [
+            .json(["id": fileID, "trashed": false]),
+            .json(DriveJSON.file(id: fileID, name: "notes.txt", trashed: true))
+        ])
+        let env = DriveTestEnvironment.make(transport: transport)
+
+        try await env.service.delete(fileID: fileID)
+        XCTAssertEqual(transport.method(at: 1), "PATCH",
+                       "Google sent no capability object, and an unknown is not a refusal")
+    }
+
+    func testADeleteBlockedByCanEditWhenCanTrashIsAbsent() async throws {
+        let transport = StubTransport(script: [
+            .json(["id": fileID, "trashed": false, "capabilities": ["canEdit": false]])
+        ])
+        let env = DriveTestEnvironment.make(transport: transport)
+
+        do {
+            try await env.service.delete(fileID: fileID)
+            XCTFail("a viewer cannot move an object to the trash")
+        } catch let error as DriveError {
+            guard case .permissionDenied = error else {
+                return XCTFail("expected permissionDenied, got \(error)")
+            }
+        }
+        XCTAssertEqual(transport.requestCount, 1)
     }
 
     func testADeleteFromTheTrashRemovesTheObjectForGood() async throws {

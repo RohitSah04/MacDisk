@@ -53,6 +53,8 @@ public actor CloudDiskProviderCore {
         case cannotCreateInTrash
         case unsupportedKind(String)
         case directoryNotEmpty(String)
+        /// A write Google's permissions do not allow, whether the check caught it or Drive did.
+        case writeNotAllowed(detail: String)
 
         public var errorDescription: String? {
             switch self {
@@ -64,6 +66,8 @@ public actor CloudDiskProviderCore {
                 return "Google Drive cannot store this kind of item: \(kind)."
             case .directoryNotEmpty(let name):
                 return "“\(name)” still contains files, so it cannot be deleted without emptying it."
+            case .writeNotAllowed(let detail):
+                return detail
             }
         }
     }
@@ -251,6 +255,11 @@ public actor CloudDiskProviderCore {
 
     // MARK: - Writing
 
+    /// Files a new object under the folder the template names.
+    ///
+    /// The destination is checked from the metadata cache rather than re-read: the folder the user
+    /// dropped into was listed moments ago, so its permissions are already in memory, and asking Drive
+    /// again would add a request to every file of a bulk drop for an answer the listing just gave.
     public func create(basedOn template: NSFileProviderItem,
                        fields: NSFileProviderItemFields,
                        contents: URL?,
@@ -261,6 +270,10 @@ public actor CloudDiskProviderCore {
             throw CoreError.cannotCreateInTrash
         }
         let parentID = ProviderIdentity.driveID(for: parentIdentifier) ?? DriveFile.rootFolderID
+        if let parent = await services.cache.cachedValue(forDriveID: parentID),
+           let refusal = WritePolicy.containerRefusal(of: parent) {
+            throw CoreError.writeNotAllowed(detail: refusal.errorDescription ?? "Write refused.")
+        }
         let name = ProviderFilename.materializable(template.filename)
         // A template imported from disk can legitimately have no resolvable type; Drive then stores it
         // as a binary object rather than the extension inventing a MIME type.
@@ -273,9 +286,19 @@ public actor CloudDiskProviderCore {
         // A reimport (after a restart, a backup restore, or a domain move) replays files that already
         // exist on disk. Matching them to the server copy is what keeps a restart from duplicating
         // everything the user had locally.
-        if options.contains(.mayAlreadyExist),
-           let matched = try await resolveReimport(name: name, parentID: parentID, localContent: contents) {
-            return WriteOutcome(item: matched.item, shouldFetchContent: matched.fetchContent)
+        if options.contains(.mayAlreadyExist) {
+            let matched: (item: NSFileProviderItem, fetchContent: Bool)?
+            do {
+                matched = try await resolveReimport(name: name, parentID: parentID,
+                                                    localContent: contents)
+            } catch {
+                // The replayed file is a local edit the user made before the restart, so a failure to
+                // push it is reported like any other upload: the system keeps the bytes and retries.
+                throw await noteWriteFailure(.upload, subject: name, error: error)
+            }
+            if let matched {
+                return WriteOutcome(item: matched.item, shouldFetchContent: matched.fetchContent)
+            }
         }
 
         let mimeType = isFolder ? DriveFile.folderMimeType
@@ -299,8 +322,8 @@ public actor CloudDiskProviderCore {
                                                           progress: progress)
             }
         } catch {
-            await reportFailure(.upload, subject: name, error: error)
-            throw error
+            let kind: ProviderState.ActivityEvent.Kind = isFolder ? .create : .upload
+            throw await noteWriteFailure(kind, subject: name, error: error)
         }
 
         await services.cache.store(created)
@@ -310,6 +333,11 @@ public actor CloudDiskProviderCore {
                                                 pinned: await services.state.isPinned(created.id)))
     }
 
+    /// Applies the fields the system says changed, one Drive call each.
+    ///
+    /// The permissions checked are the ones on the metadata fetched here, not the ones the system
+    /// enumerated with: a file shared "can view" five minutes ago looks writable in the system's
+    /// replica, and the only honest moment to refuse is the one where Google's own answer is in hand.
     public func modify(_ item: NSFileProviderItem,
                        baseVersion: NSFileProviderItemVersion,
                        changedFields: NSFileProviderItemFields,
@@ -320,13 +348,18 @@ public actor CloudDiskProviderCore {
         let current = try await services.drive.file(id: driveID)
         let pinned = await services.state.isPinned(driveID)
 
-        if current.isGoogleNative && !current.isFolder {
-            // Workspace documents are exported on read and have no upload path, so none of their
-            // fields can be written. Declaring every requested field still pending is the extension
-            // saying "not supported" without failing the user's action.
-            return WriteOutcome(item: services.item(for: current, pinned: pinned),
-                                pendingFields: changedFields)
+        if let refusal = WritePolicy.refusal(for: changedFields, on: current) {
+            throw await noteWriteFailure(Self.activityKind(for: changedFields),
+                                         subject: current.name,
+                                         error: CoreError.writeNotAllowed(
+                                            detail: refusal.errorDescription ?? "Write refused."))
         }
+
+        // A Google Workspace document is exported on read and has no upload path, so its bytes cannot
+        // land. Its name and folder are ordinary metadata and Drive writes them like any other file,
+        // so only content is refused — failing a rename because the content cannot move would throw
+        // away a write Drive is perfectly able to do.
+        let contentIsUnwritable = current.isGoogleNative && !current.isFolder
 
         var pending = NSFileProviderItemFields()
         for field in Self.nonWritableFields where changedFields.contains(field) {
@@ -336,32 +369,53 @@ public actor CloudDiskProviderCore {
         var result = current
         var shouldFetchContent = false
 
-        if changedFields.contains(.contents), let newContents {
-            let upload = try await uploadContent(newContents, onto: current, baseVersion: baseVersion,
-                                                 newName: changedFields.contains(.filename)
-                                                    ? ProviderFilename.materializable(item.filename)
-                                                    : nil,
-                                                 options: options, progress: progress)
-            result = upload.item
-            shouldFetchContent = upload.replaceLocalBytes
+        if changedFields.contains(.contents), let newContents, !contentIsUnwritable {
+            do {
+                let upload = try await uploadContent(newContents, onto: current,
+                                                     baseVersion: baseVersion,
+                                                     newName: changedFields.contains(.filename)
+                                                        ? ProviderFilename.materializable(item.filename)
+                                                        : nil,
+                                                     options: options, progress: progress)
+                result = upload.item
+                shouldFetchContent = upload.replaceLocalBytes
+            } catch {
+                throw await noteWriteFailure(.upload, subject: current.name, error: error)
+            }
         } else if changedFields.contains(.contents) {
-            // Asked to sync content with nothing to upload: the disk copy is authoritative and already
-            // matches, so acknowledge without touching the server.
+            // Either there are no bytes to upload — the disk copy is authoritative and already matches —
+            // or the object is a document Drive will not accept bytes for. Declaring the field still
+            // pending is the extension saying "this part did not land" without failing the writes
+            // beside it, and it keeps the system holding the local copy instead of discarding it.
             pending.insert(.contents)
         }
 
-        if changedFields.contains(.filename), result.name != item.filename {
-            result = try await services.drive.rename(fileID: result.id,
-                                                     to: ProviderFilename.materializable(item.filename))
+        let requestedName = ProviderFilename.materializable(item.filename)
+        if changedFields.contains(.filename), result.name != requestedName {
+            do {
+                result = try await services.drive.rename(fileID: result.id, to: requestedName)
+            } catch {
+                throw await noteWriteFailure(.rename, subject: current.name, error: error)
+            }
         }
 
         if changedFields.contains(.parentItemIdentifier) {
             let newParentID = ProviderIdentity.driveID(for: item.parentItemIdentifier)
                 ?? DriveFile.rootFolderID
+            if let parent = await services.cache.cachedValue(forDriveID: newParentID),
+               let refusal = WritePolicy.containerRefusal(of: parent) {
+                throw await noteWriteFailure(.move, subject: result.name,
+                                             error: CoreError.writeNotAllowed(
+                                                detail: refusal.errorDescription ?? "Write refused."))
+            }
             if newParentID != current.parentID {
-                result = try await services.drive.move(fileID: result.id,
-                                                       from: current.parentID ?? DriveFile.rootFolderID,
-                                                       to: newParentID)
+                do {
+                    result = try await services.drive.move(fileID: result.id,
+                                                           from: current.parentID ?? DriveFile.rootFolderID,
+                                                           to: newParentID)
+                } catch {
+                    throw await noteWriteFailure(.move, subject: result.name, error: error)
+                }
             }
         }
 
@@ -383,15 +437,22 @@ public actor CloudDiskProviderCore {
                             shouldFetchContent: shouldFetchContent)
     }
 
+    /// Moves one object to Drive's trash, or removes it for good when it is already there.
+    ///
+    /// The activity record uses the name from the metadata cache when the item was listed recently;
+    /// a bare Drive id in the user's activity log is unreadable, and fetching the name costs a request
+    /// on every delete to dress up a log line.
     public func delete(identifier: NSFileProviderItemIdentifier,
                        baseVersion: NSFileProviderItemVersion?,
                        options: NSFileProviderDeleteItemOptions) async throws {
         let driveID = try requireDriveID(identifier)
+        let subject = await services.cache.cachedValue(forDriveID: driveID)?.name ?? driveID
 
         if !options.contains(.recursive) {
             let children = try await services.drive.childrenPage(parentID: driveID)
             if let first = children.fileList.first {
-                throw CoreError.directoryNotEmpty(first.name)
+                throw await noteWriteFailure(.delete, subject: subject,
+                                             error: CoreError.directoryNotEmpty(first.name))
             }
         }
 
@@ -400,15 +461,14 @@ public actor CloudDiskProviderCore {
             // already trashed removes it for good — the same two cases File Provider distinguishes.
             try await services.drive.delete(fileID: driveID)
             await services.cache.invalidate(driveID)
-            try await services.state.record(.init(kind: .delete, outcome: .success, subject: driveID))
-        } catch let error as DriveError {
-            if case .itemNotFound = error {
+            try await services.state.record(.init(kind: .delete, outcome: .success, subject: subject))
+        } catch {
+            if let driveError = error as? DriveError, case .itemNotFound = driveError {
                 // Already gone remotely: the requested state holds, so report success as Apple requires.
                 await services.cache.invalidate(driveID)
                 return
             }
-            await reportFailure(.delete, subject: driveID, error: error)
-            throw error
+            throw await noteWriteFailure(.delete, subject: subject, error: error)
         }
     }
 
@@ -450,6 +510,23 @@ public actor CloudDiskProviderCore {
         let detail = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         try? await services.state.record(.init(kind: kind, outcome: outcome,
                                                subject: subject, detail: detail))
+    }
+
+    /// Records a failed write and hands back the error the system should see.
+    ///
+    /// Two things change on the way out. The failure is logged, so the Activity screen shows what the
+    /// user tried rather than only what succeeded; and a refusal Google sent during a *write* is
+    /// reported as a write refusal, because the alert the system raises for the two codes says "you
+    /// can't save here" or "you can't open this" and the second one sends the user looking for a
+    /// permission that is not the problem.
+    private func noteWriteFailure(_ kind: ProviderState.ActivityEvent.Kind,
+                                  subject: String,
+                                  error: Error) async -> Error {
+        await reportFailure(kind, subject: subject, error: error)
+        if case DriveError.permissionDenied(let detail) = error {
+            return CoreError.writeNotAllowed(detail: detail)
+        }
+        return error
     }
 
     // MARK: Reimport matching

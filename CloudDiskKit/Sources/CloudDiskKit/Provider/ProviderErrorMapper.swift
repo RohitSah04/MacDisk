@@ -101,6 +101,10 @@ public enum ProviderErrorMapper {
             return fileProvider(.directoryNotEmpty, detail: describe(coreError))
         case .cannotCreateInTrash, .unsupportedKind:
             return cocoa(.featureUnsupported, detail: describe(coreError))
+        case .writeNotAllowed:
+            // The write-specific code, because this is the failure Finder shows next to the item the
+            // user tried to change; a read code would describe a problem they never had.
+            return cocoa(.fileWriteNoPermission, detail: describe(coreError))
         }
     }
 

@@ -156,11 +156,31 @@ a parallel cache: they are derived from File Provider's own answers (`isDownload
 - `createItem` performs a real upload: multipart for small files, resumable (`POST /upload…?uploadType=resumable`)
   for large ones, and returns the **server** item so the system adopts the server ID and version.
 - `modifyItem` inspects `changedFields`: content changes upload new bytes; name/parent changes map to
-  Drive rename/move (`parents` add-remove). `baseVersion` is compared against the server version and
-  a mismatch returns `NSFileProviderErrorServerVersionMismatch`-style conflict so the system keeps
-  both copies rather than silently overwriting.
-- Failed operations are recorded in the App Group activity store with a retry action, so the
-  Activity screen reflects real failures rather than a fabricated list.
+  Drive rename/move (`parents` add-remove). `baseVersion` is compared against the server copy and a
+  mismatch keeps both rather than silently overwriting: the remote object keeps Google's newest
+  version, the local bytes become a "… (conflicted copy)" file beside it, and `shouldFetchContent`
+  tells the system to re-read the winner. Where the system asks for the other policy
+  (`NSFileProviderModifyItemOptions.failOnConflict`, macOS 26+) the extension throws
+  `NSFileProviderErrorLocalVersionConflictingWithServer` instead.
+- **Permissions are checked before the request, not only advertised.** `WritePolicy` reads Drive's
+  `capabilities` on the metadata the write has already fetched — plus the cached listing of a
+  destination folder — and refuses only on an explicit `false`: `canEdit` for content, rename and
+  metadata; `canMoveItemOutOfWorld` for leaving someone else's folder; `canAddChildren` for the folder
+  receiving a create or a move, which is the one permission the system cannot validate for a provider
+  because it checks the item being moved, not the destination; and the trash flag outranks all of them.
+  Drive's `canTrash`/`canEdit` ride along in the same `files.get` that already decides
+  trash-versus-permanent-delete. What Google did not say is not a refusal — its 403 stays the authority
+  for a permission that changed after the listing, and a false guess from missing fields would make an
+  editable object uneditable.
+- A denied save is reported as `NSCocoaErrorDomain`/`fileWriteNoPermission` (`CoreError.writeNotAllowed`),
+  never as a read failure, and every write failure — upload, rename, move, delete, or a local edit
+  replayed after a restart — is recorded in the App Group activity store with the item's filename, so
+  the Activity screen reflects real failures rather than a fabricated list.
+- A Google Workspace document's name and folder are ordinary Drive metadata and are written; only its
+  content stays pending, because Drive has no upload path for an exported document.
+- There is no CloudDisk-side write queue. File Provider journals a pending change itself, survives an
+  extension restart, and replays it into `createItem` with `.mayAlreadyExist` — which is what the
+  reimport matching exists to answer without duplicating the user's files.
 
 ## Streaming
 
