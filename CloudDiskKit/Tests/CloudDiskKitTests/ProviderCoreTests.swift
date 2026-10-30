@@ -1653,7 +1653,9 @@ final class ProviderCoreTests: XCTestCase {
         try await harness.state.setPinned(Self.fileID, false)
         await harness.services.cache.invalidate(Self.fileID)
         let lazy = try await harness.core.item(for: Self.fileIdentifier)
-        XCTAssertEqual(lazy.contentPolicy, .downloadLazily)
+        // Not `.downloadLazily`: an explicit child policy overrides the container's, so inheriting is
+        // what lets a folder the user kept offline carry that pin down to this file.
+        XCTAssertEqual(lazy.contentPolicy, .inherited)
     }
 
     // MARK: Helpers

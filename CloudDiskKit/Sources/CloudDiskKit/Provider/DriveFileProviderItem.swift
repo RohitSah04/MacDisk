@@ -42,9 +42,23 @@ public final class DriveFileProviderItem: NSObject, NSFileProviderItem {
 
     // MARK: Construction
 
+    /// The content policy CloudDisk publishes for one item.
+    ///
+    /// A pinned object asks the system to download it eagerly and to never evict it, which is the
+    /// whole of "available offline": FPFS owns the bytes, the retry schedule and the low-space
+    /// decisions, so there is no CloudDisk download loop.
+    ///
+    /// Everything else reports `.inherited` — Apple's own default for a non-root item — rather than an
+    /// explicit lazy policy. That is what makes a pinned *folder* carry its pin down to what is inside
+    /// it: children resolve against their parent's policy, so one mark from the user covers a tree
+    /// without CloudDisk enumerating and pinning every descendant.
+    static func contentPolicy(pinned: Bool) -> NSFileProviderContentPolicy {
+        pinned ? .downloadEagerlyAndKeepDownloaded : .inherited
+    }
+
     /// Wraps a Drive file as it appeared in `parent`, optionally pinned for offline use.
     static func make(from file: DriveFile,
-                     contentPolicy: NSFileProviderContentPolicy = .downloadLazily) -> DriveFileProviderItem {
+                     contentPolicy: NSFileProviderContentPolicy = .inherited) -> DriveFileProviderItem {
         let identifier = ProviderIdentity.identifier(forDriveID: file.id)
         let isFolder = file.isFolder
 

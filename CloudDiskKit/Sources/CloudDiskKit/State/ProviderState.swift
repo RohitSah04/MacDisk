@@ -137,7 +137,8 @@ public actor ProviderState {
     /// response bodies — only what the user needs to understand what CloudDisk did.
     public struct ActivityEvent: Codable, Equatable, Identifiable, Sendable {
         public enum Kind: String, Codable, Sendable {
-            case download, upload, create, rename, move, copy, delete, synchronize, signOut, signIn, other
+            case download, upload, create, rename, move, copy, delete, synchronize, signOut, signIn
+            case pin, unpin, other
         }
 
         public enum Outcome: String, Codable, Sendable {

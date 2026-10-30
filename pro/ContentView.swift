@@ -37,6 +37,7 @@ struct ContentView: View {
         .frame(minWidth: 720, minHeight: 460)
         .refreshable {
             await core.refreshStorage()
+            await core.refreshLocalCache()
         }
     }
 
@@ -63,6 +64,8 @@ struct ContentView: View {
             keychainRow
             Divider()
             storageRow
+            Divider()
+            localCacheRow
         }
     }
 
@@ -240,6 +243,104 @@ struct ContentView: View {
         return text
     }
 
+    // MARK: Local cache
+
+    /// The bytes File Provider is holding for CloudDisk, measured on disk: a row that can be green or
+    /// red without asking Google anything.
+    @ViewBuilder
+    private var localCacheRow: some View {
+        switch core.localCache {
+        case .unknown:
+            Row(title: "Local cache", systemImage: "externaldrive", tint: .secondary,
+                detail: "Not measured yet.") { EmptyView() }
+        case .loading:
+            Row(title: "Local cache", systemImage: "externaldrive", tint: .secondary,
+                detail: "Asking Finder which CloudDisk files it is holding…") {
+                ProgressView().controlSize(.small)
+            }
+        case .loaded(let inventory):
+            Row(title: "Local cache", systemImage: "externaldrive.fill", tint: .accentColor,
+                detail: cacheText(inventory)) {
+                VStack(alignment: .trailing, spacing: 4) {
+                    HStack(spacing: 8) {
+                        Button("Re-measure") {
+                            Task { await core.refreshLocalCache() }
+                        }
+                        Button("Clear cached files") {
+                            Task { await core.clearLocalCache() }
+                        }
+                        .disabled(inventory.evictableCount == 0)
+                    }
+                    if let report = core.lastEviction {
+                        Text(evictionText(report))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.trailing)
+                    }
+                }
+            }
+        case .unavailable(let message):
+            Row(title: "Local cache", systemImage: "questionmark.circle", tint: .secondary,
+                detail: message) {
+                Button("Retry") {
+                    Task { await core.refreshLocalCache() }
+                }
+            }
+        }
+    }
+
+    private func cacheText(_ inventory: CacheInventory) -> String {
+        guard inventory.fileCount > 0 else {
+            return "Finder is holding no CloudDisk file on this Mac — everything is online-only."
+        }
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .file
+        var text = "\(formatter.string(fromByteCount: inventory.materializedBytes)) in "
+            + "\(inventory.fileCount) file\(inventory.fileCount == 1 ? "" : "s")"
+        if inventory.folderCount > 0 {
+            text += " across \(inventory.folderCount) folder\(inventory.folderCount == 1 ? "" : "s")"
+        }
+        if inventory.pinnedCount > 0 {
+            text += " — \(inventory.pinnedCount) kept offline"
+        }
+        if !inventory.isExact {
+            text += " (\(inventory.unmeasuredFileCount) could not be measured, so this is a floor)"
+        }
+        return text
+    }
+
+    /// What the last "clear cached files" run achieved, including what Finder refused and why.
+    private func evictionText(_ report: EvictionReport) -> String {
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .file
+        var lines: [String] = []
+        if report.released.isEmpty {
+            lines.append("Nothing was eligible to free")
+        } else {
+            var freed = "Freed \(report.released.count) file"
+                + (report.released.count == 1 ? "" : "s")
+                + " (\(formatter.string(fromByteCount: report.freedBytes)))"
+            if report.unmeasuredReleasedCount > 0 {
+                freed += ", \(report.unmeasuredReleasedCount) size"
+                    + (report.unmeasuredReleasedCount == 1 ? "" : "s") + " unknown"
+            }
+            lines.append(freed)
+        }
+        if !report.kept.isEmpty {
+            var counts: [EvictionRefusal: Int] = [:]
+            for kept in report.kept { counts[kept.refusal, default: 0] += 1 }
+            let reasons = counts.keys.sorted { $0.rawValue < $1.rawValue }
+                .map { "\(counts[$0] ?? 0) \($0.sentence)" }
+                .joined(separator: "; ")
+            lines.append("Still on disk: \(reasons)")
+        }
+        if !report.failures.isEmpty {
+            lines.append("\(report.failures.count) refused by Finder"
+                       + (report.failures.first.map { ": \($0.reason)" } ?? ""))
+        }
+        return lines.joined(separator: ". ")
+    }
+
     // MARK: Activity
 
     private var activityCard: some View {
@@ -348,6 +449,8 @@ private extension ProviderState.ActivityEvent.Kind {
         case .synchronize: return "Synced"
         case .signIn: return "Connected"
         case .signOut: return "Signed out of"
+        case .pin: return "Kept offline"
+        case .unpin: return "Released offline"
         case .other: return "Recorded"
         }
     }

@@ -257,8 +257,86 @@ without a signed-in domain and is recorded as unverified.
 
 ## Phase 6 — Cache and offline
 
-`contentPolicy` pinning, eviction of eligible cache, real cache-size reporting from the
-materialized-items enumerator, no competing cache.
+**Done as far as this machine allows** (319 tests, 17 skipped, 0 failures;
+`xcodebuild -scheme CloudDisk` green). CloudDisk now answers "what is this Finder location costing my
+disk?", "which of it can I get back?" and "keep this one offline" from File Provider's own store and
+from APFS — never from a CloudDisk ledger, and never by holding a second copy of the bytes.
+
+| Piece | File | What it does |
+| --- | --- | --- |
+| The system's side of the cache | `Cache/CacheSystem.swift` | One protocol for the five questions that are not about Google: what is materialized (`enumeratorForMaterializedItems`, pages starting at `NSFileProviderPage(Data())`), where each item lives (`getUserVisibleURL`), will you release it (`evictItem`), will you download it (`__requestDownloadForItem` with the whole-object range), and re-signal a container. `FileProviderCacheSystem` is the real thing; `UnavailableCacheSystem` answers an unmounted domain's way — an explanation, never a zero |
+| Measurement | `Cache/OfflineStore.swift` | `inventory()` walks those rows, measures each user-visible path with `totalFileAllocatedSize` and produces `CacheInventory`: materialized / pinned / evictable bytes, counts, and an explicit `isExact` flag with the number of files whose bytes could not be named |
+| Release | same | `releaseEligibleItems()` offers every non-folder, non-pinned row and classifies the system's answer into released / refused-with-a-reason / failed. `release(driveID:name:)` is the single-file version |
+| Pinning | same + `Provider/DriveFileProviderItem.swift` | A pin is published as `contentPolicy`: `.downloadEagerlyAndKeepDownloaded` for kept-offline, `.inherited` otherwise, then the container is signalled so the policy reaches the disk replica and the item itself is asked for immediately |
+| Shared vocabulary | `State/ProviderState.swift` | `pin` / `unpin` activity kinds, so "Kept offline" and "Released offline" appear in the user's log next to downloads and deletes |
+| App wiring | `Provider/ProviderServices.swift`, `pro/AppCore.swift`, `pro/ContentView.swift` | `ProviderServices` owns the `CacheSystem` (real when a domain resolves, unavailable otherwise); `AppCore` publishes `localCache`, `lastEviction`, `refreshLocalCache()`, `clearLocalCache()` and `setKeepOffline(_:pinned:)`; the status window gained a "Local cache" row with the real figure, a Re-measure / Clear cached files pair, and the refusal sentences |
+| No competing cache | — | Deliberately absent: no CloudDisk content store, no `materializedItemsDidChange` (CloudDisk publishes the whole changes feed as its working set, so implementing it would loop materialize → signal → drain), no macOS 27 `NSFileProviderNamespacePolicyMaterializeEagerly` (it would eager-download every file in the domain, the opposite of a virtual drive) |
+
+| Area | Proven by |
+| --- | --- |
+| Measurement (8 cases) | a 4 KB file declared as 5 MB contributes its **disk** blocks and nothing else; pinned / evictable byte split over real files; a folder's own directory blocks are not counted as cached content; the mount point and the virtual namespaces are not counted as content at all; a path that is a directory on disk wins over a row that claims a file; an item with no path or a gone path reports `unmeasuredFileCount` and `isExact == false` instead of 0 bytes; pins are re-read from shared state on every call, so the extension's writes are seen; `UnavailableCacheSystem` and a truncated enumeration both throw rather than reporting an empty cache |
+| Release (8 cases) | the pinned file is never even offered, because eviction aborts at the first non-evictable child; folders are never offered; each refusal code maps to its own sentence (`.nonEvictable`, `.unsyncedEdits`, `.noSuchItem` → already absent, `EBUSY` → open in another app); an unexpected error is a **failure**, not a refusal; one refusal does not stop the rest of the sweep; a released file whose size was unknown keeps the freed total a floor; a single named release touches exactly that identifier; the run writes one activity line and a run with nothing to free writes none |
+| Pinning (7 cases) | pin → policy published, parent container signalled, whole-object download requested by identifier, activity line "Downloading now; kept offline afterwards"; trashed item signals Trash rather than its stale Drive parent; `.noSuchItem` from the download ask becomes "downloads as soon as Finder lists the file" and still counts as a kept promise; a refusal keeps the mark **and** logs a failure with the system's own sentence; unpin never asks for a download; a pin whose shared write fails is reported as not-in-effect and claims nothing downstream; with no domain the answer says the location is missing |
+| Provider publishing (3 cases) | a pinned item carries `.downloadEagerlyAndKeepDownloaded` through `item(for:)`, an unpinned one inherits, and `items(from:)` reads the pin set once per page |
+| App wiring (2 cases) | no manager ⇒ `ProviderServices.offline` throws `.unavailable` rather than returning an empty inventory; scripted system ⇒ the store reports exactly what the script said |
+
+**Defects and traps found in this phase and fixed** — one found by the compiler, one found by running
+the app against its own mounted domain, four near-misses:
+1. `setPinned` wrote the pin with `try?`, so an App Group container that could not be written produced
+   a successful-looking outcome *and* a download request for bytes nobody had promised to keep. A failed
+   persist is now `.systemUnavailable`, the activity line is a failure, and no signal or download is
+   claimed.
+2. Unpinned items were published as `.downloadLazily`. That is an explicit child policy, and an explicit
+   child policy overrides the container's — so "keep this folder offline" would have pinned the folder
+   and left every file inside it evictable. Unpinned now means `.inherited`; two assertions written
+   against the old value were corrected, and the reason is stated in the test that pins it down.
+3. `NSFileProviderItem.documentSize` imports as `NSNumber??` (nullable *and* optional protocol
+   requirement), so `documentSize?.int64Value` does not compile and a careless unwrap reads "no size"
+   for an item that does have one. Both levels are handled explicitly.
+4. `error as? NSFileProviderError` then `.code` is used for classification rather than comparing
+   `NSError` codes: the provider-side error and the object that comes back through the bridge are
+   different Swift types.
+5. No pre-filter on `isUploaded` before eviction. It is an optional protocol requirement, and an absent
+   `BOOL` reads as NO through the bridge — pre-filtering on it would have declared every item dirty.
+   The system's own `.unsyncedEdits` refusal is what decides, and it is reported as "still holds
+   changes that have not reached Google Drive" rather than as a failure.
+6. The mount point counts as a materialized item. Found by running the app: an empty, signed-out
+   CloudDisk domain reported its own root folder (and Trash) as cached content, so the row read
+   "Zero KB in 0 files across 1 folder" — a number that is not a lie but is not an answer either.
+   `inventory()` now drops container identifiers, and the empty-state sentence is keyed on
+   `fileCount > 0` rather than on `items` being empty, because a domain can hold folder rows and no
+   file bytes. Removing the filter makes the new test fail on two assertions.
+
+Every guard added here is **mutation-verified** (nine mutants, seven caught by the named test, one —
+forcing a released file's bytes to `nil` — caught by two others, and one provably equivalent: counting
+a folder's bytes cannot change a total because folder rows never carry `allocatedBytes`, which is why
+the folder test asserts that nil directly).
+
+**What was run against the real system.** The built app was launched with this code in place, and the
+"Local cache" row was read by a human eye: the domain registered and mounted at
+`~/Library/CloudStorage/CloudDisk-CloudDisk`, `getUserVisibleURL` named that path, the
+materialized-items enumerator answered — one page, containing the domain's own containers — instead of
+hanging or throwing, and `OfflineStore.inventory()` turned that into a reading the UI displayed. That
+run is what found defect 6, and a second run confirmed the fix reads as
+"Finder is holding no CloudDisk file on this Mac — everything is online-only" with "Clear cached files"
+disabled.
+
+**Not verified and not claimable here.** Nothing was signed in during that run, so no Drive object was
+ever materialized: the byte arithmetic over real content, the pinned / unmeasured / freed sentences, and
+all three write-side calls (`evictItem`, `__requestDownloadForItem`, `signalEnumerator`) were never
+asked of the live system, and a multi-page enumeration was never seen. Those are the calls inside
+`FileProviderCacheSystem` that the scripted suite cannot reach. `DomainCacheSmokeTests` aims at the
+read paths over a mounted domain, read-only and with a deadline so a silent system skips instead of
+hanging — and all three cases **skip on this machine**, because `NSFileProviderManager.domains()`
+answers for the calling process and a command-line test binary is not an app with CloudDisk's
+entitlements. Running them needs an app-target context (Phase 8). Likewise unobservable
+here: that FPFS actually holds `.downloadEagerlyAndKeepDownloaded` bytes across a reboot; that a pinned
+folder's inheritance reaches its children (the rule is Apple's, the cascade is not measured); that a
+partially materialized file reports allocated bytes below its declared length on a real domain (APFS
+allocated the whole file for a hand-made sparse test, so the distinction is proven by the code reading
+disk blocks rather than by an observed hole); and Finder's own "Keep Downloaded" menu item, which writes
+File Provider's preference and **not** CloudDisk's pin set — the two are independent by design, so a
+file pinned in Finder is invisible to CloudDisk's list and vice versa.
 
 ## Phase 7 — Production UI
 

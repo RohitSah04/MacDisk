@@ -11,18 +11,28 @@ public final class ProviderServices: @unchecked Sendable {
     public let drive: DriveService
     public let state: ProviderState
     public let cache: DriveMetadataCache
+    /// The system side of the local cache: what is on disk, where it is, and how to release it.
+    public let cacheSystem: any CacheSystem
+    /// Pinning, cache measurement and eviction, shared by the app and the extension.
+    public let offline: OfflineStore
     let manager: NSFileProviderManager?
 
     public init(config: CloudDiskConfig,
                 drive: DriveService,
                 state: ProviderState,
                 manager: NSFileProviderManager? = nil,
+                cacheSystem: (any CacheSystem)? = nil,
                 cacheTTL: TimeInterval = 10) {
         self.config = config
         self.drive = drive
         self.state = state
         self.manager = manager
         self.cache = DriveMetadataCache(ttl: cacheTTL)
+        let system = cacheSystem
+            ?? manager.map { FileProviderCacheSystem(manager: $0) }
+            ?? UnavailableCacheSystem()
+        self.cacheSystem = system
+        self.offline = OfflineStore(state: state, cacheSystem: system)
     }
 
     /// Builds the whole dependency graph from an Info.plist-derived configuration.
@@ -97,8 +107,8 @@ extension ProviderServices {
     /// provider-side download loop.
     func item(for file: DriveFile, pinned: Bool) -> NSFileProviderItem {
         DriveFileProviderItem.make(from: file,
-                                   contentPolicy: pinned ? .downloadEagerlyAndKeepDownloaded
-                                                         : .downloadLazily)
+                                   contentPolicy: DriveFileProviderItem
+                                                    .contentPolicy(pinned: pinned))
     }
 
     func item(for file: DriveFile) async -> NSFileProviderItem {
@@ -116,8 +126,8 @@ extension ProviderServices {
             await cache.store(resolved)
             result.append(DriveFileProviderItem.make(
                 from: resolved,
-                contentPolicy: pins.contains(resolved.id)
-                    ? .downloadEagerlyAndKeepDownloaded : .downloadLazily))
+                contentPolicy: DriveFileProviderItem
+                    .contentPolicy(pinned: pins.contains(resolved.id))))
         }
         return result
     }

@@ -40,18 +40,20 @@ costs only duplicate symbol size.
 
 | Area | Files | Responsibility |
 | --- | --- | --- |
-| `Models` | `DriveFile.swift`, `DriveChanges.swift`, `DriveAbout.swift` | Codable Drive v3 resources, with the field set the provider actually needs |
+| `Models` | `DriveFile.swift`, `DriveResponses.swift` | Codable Drive v3 resources — the file shape with its `capabilities`, plus about/changes/export responses |
 | `Networking` | `HTTPTransport.swift`, `DriveError.swift` | Transport protocol (injectable for tests), typed error taxonomy, retryability |
-| `Auth` | `Credential.swift`, `KeychainCredentialStore.swift`, `TokenProvider.swift` | Shared-keychain credential store, single-flight refresh, 401 → refresh → retry once |
-| `Drive` | `DriveService.swift`, `DrivePaged.swift`, `QueryEscaping.swift` | Full v3 surface: list/get/download/range/upload/create/rename/move/copy/trash/changes/about/export |
-| `Provider` | `CloudDiskProviderCore.swift`, `DriveFileProviderItem.swift`, `DriveEnumerator.swift`, `SyncAnchor.swift`, `PendingOps.swift` | The File Provider implementation, independent of the app-extension target so it is unit-testable |
-| `Streaming` | `RangeReader.swift`, `DriveResourceLoader.swift` | Authenticated byte-range reads; `AVAssetResourceLoaderDelegate` for the built-in player |
-| `State` | `SyncCursorStore.swift`, `ActivityStore.swift`, `DomainRegistry.swift` | Persistence of cursors/anchors, app-group activity log, domain identifier constants |
-| `App` | `AppModel.swift`, `DriveBrowserModel.swift` | Observable state for the UI, no GoogleSignIn import (keeps the package dependency-free) |
+| `Auth` | `GoogleCredential.swift`, `GoogleOAuthClient.swift`, `KeychainCredentialStore.swift`, `TokenProvider.swift` | Shared-keychain credential store, token endpoint without the SDK, single-flight refresh, 401 → refresh → retry once |
+| `Drive` | `DriveService.swift`, `DriveService+Transfer.swift`, `DriveQuery.swift` | Full v3 surface: list/get/download/range/upload/create/rename/move/copy/trash/changes/about/export, and the query/id escaping that Google requires |
+| `Provider` | `CloudDiskFileProviderAgent.swift`, `CloudDiskProviderCore.swift`, `DriveFileProviderItem.swift`, `DriveEnumerator.swift`, `ProviderIdentity.swift`, `ProviderErrorMapper.swift`, `ProviderServices.swift`, `ProviderOperation.swift`, `PartialExtent.swift`, `WritePolicy.swift`, `CloudDiskDomain.swift` | The File Provider implementation, independent of the app-extension target so it is unit-testable: replication, enumeration, identifiers, error bridging, shared dependencies, byte extents, the write permission table and the domain descriptor |
+| `Cache` | `CacheSystem.swift`, `OfflineStore.swift` | The system's side of the local cache (materialized inventory, user-visible URLs, eviction, download requests, container signals) and everything CloudDisk does with those answers: measurement, "clear cached files" and "keep offline" |
+| `Streaming` | `DriveRangeReader.swift`, `DriveAssetResourceLoader.swift` | Authenticated byte-range reads; `AVAssetResourceLoaderDelegate` for the built-in player |
+| `State` | `ProviderState.swift` | The App Group files both processes share: sync cursor, pin set, activity log, extension heartbeat |
+| root | `CloudDiskConfig.swift` | Info.plist-derived client ID, scope, keychain access group, App Group container and display name |
 
-The extension target is a thin shim: `FileProviderExtension.swift` forwards
-`NSFileProviderReplicatedExtension` methods to a `CloudDiskProviderCore` instance. All real logic
-lives in the package and is testable without `fileproviderd`.
+The extension target is a thin shim: `CloudDiskProvider/FileProviderExtension.swift` is one line —
+`final class FileProviderExtension: CloudDiskFileProviderAgent {}` — because
+`NSExtensionPrincipalClass` has to name a class in the extension's own binary. The agent, and every
+method it implements, lives in the package, so the whole provider is testable without `fileproviderd`.
 
 ## Authentication
 
@@ -139,17 +141,40 @@ The heartbeat is liveness only. It never carries a token, an account or a URL wi
 
 ## Storage states
 
-Cloud-only → downloading → downloaded → offline-pinned → uploading → pending → error. These are not
-a parallel cache: they are derived from File Provider's own answers (`isDownloaded`,
-`isUploading`, `downloadingError`, the materialized-items enumerator from
-`NSFileProviderManager.enumeratorForMaterializedItems`) plus `NSFileProviderItem.contentPolicy`.
+Two questions, answered separately and never from a CloudDisk ledger of bytes:
 
-- "Keep offline" sets `contentPolicy = .downloadEagerlyAndKeepDownloaded` on the item and marks the
-  file non-purgeable, which is what prevents eviction from selecting it.
-- "Clear eligible cache" iterates materialized items, skips pinned and in-use ones and calls
-  `evictItem(identifier:completionHandler:)`, reporting `NSFileProviderErrorUnsyncedEdits` and
-  `EBUSY` results instead of pretending they succeeded.
-- No custom cache directory exists anywhere in the design.
+**What the Finder location costs on this Mac.** `AppCore.LocalCache` is the UI state —
+`.unknown / .loading / .loaded(CacheInventory) / .unavailable(reason)` — and `OfflineStore.inventory()`
+produces the inventory: materialized, pinned and evictable bytes, file and folder counts, and an
+`isExact` flag with the number of items whose size could not be named. Every input is the system's own:
+`NSFileProviderManager.enumeratorForMaterializedItems()` for the set, `getUserVisibleURL(for:)` for the
+path, `totalFileAllocatedSize` for the bytes. `declaredBytes` from the item is carried for display only,
+because for a partly materialized object it is the length of the whole thing, not of the part on disk.
+
+**Whether one object must stay.** A "keep offline" mark is a Drive id in the App Group pin set
+(`ProviderState.setPinned`), which the extension reads when it publishes items, translated into
+`NSFileProviderItemProtocol.contentPolicy`:
+
+- pinned → `.downloadEagerlyAndKeepDownloaded`, which is both the eager download and the non-evictable
+  mark. The macOS 12-era `.allowsEvicting` capability is deprecated and not used, and nothing is
+  separately flagged "non-purgeable": the policy is what the system reads.
+- unpinned → `.inherited`, deliberately not `.downloadLazily`. An explicit child policy overrides the
+  container's, so a child that says "lazily" would not inherit its folder's keep-offline mark.
+- the three virtual containers (root, Trash, working set) keep `.downloadLazily`; they have no bytes.
+
+Pinning then signals the parent container so the new policy reaches the disk replica, and asks
+`__requestDownloadForItem(withIdentifier:requestedRange:)` for the whole object — a Finder-side download
+otherwise only starts when the user opens the file.
+
+- "Clear cached files" (`OfflineStore.releaseEligibleItems()`) iterates the materialized inventory,
+  skips folders and pinned items **without offering them** — eviction stops at the first non-evictable
+  child of a folder — calls `evictItem(identifier:)` on the rest, and reports each refusal under its own
+  heading (`.nonEvictable`, `.unsyncedEdits`, `EBUSY`, already-absent) separately from a real failure.
+- Per-item progress and error flags (`isUploading` and the rest) are read inside the extension where the
+  system asks for them; they are not mirrored into a second state machine the app would have to keep
+  in sync.
+- No custom cache directory exists anywhere in the design. File content is never stored by CloudDisk;
+  only metadata is cached, and it is a 10-second TTL cache of Drive answers, not bytes.
 
 ## Sync and write path
 
@@ -202,8 +227,28 @@ Two distinct paths, because they are genuinely different:
 
 ## Testing strategy
 
-- Pure logic (Drive service, token provider, query escaping, page/anchor encoding, item mapping,
-  error taxonomy, pending-op queue) → `CloudDiskTests` with a stubbed `HTTPTransport`.
-- File Provider behaviour that needs `fileproviderd` → manual/launch validation on this Mac, with
-  the outcome recorded per-item in `docs/TESTING.md`. Anything not actually run is marked
-  unverified, never "passing".
+Three seams, each one there because some part of the system cannot be reached from a unit test:
+
+- `HTTPTransport` → `StubTransport` scripts Drive's replies in order, so "this request must not be made"
+  is provable: the stub runs out of scripted responses and the test fails. This is how the whole Drive
+  layer — pagination, ranges, resumable sessions, the changes feed, retry, the 401 path — is tested
+  without network access or credentials.
+- `CacheSystem` → `ScriptedCacheSystem` answers the five File Provider questions (what is materialized,
+  where it lives, will you evict, will you download, signal) with recorded calls, so inventory
+  arithmetic, which items are offered for eviction and how each refusal is named are all testable
+  against real files on real disk while `fileproviderd` stays out of it. `FileProviderCacheSystem`
+  itself therefore has no unit coverage and is listed as unverified.
+- `ProviderState(directory:)` points the App Group files at a temporary directory, and a second instance
+  over the same directory stands in for the other process — which is what proves the pin set and the
+  activity log really are cross-process state rather than process memory.
+
+- Pure logic (Drive service, token provider, query escaping, page/anchor encoding, item mapping, error
+  taxonomy, write permissions, cache arithmetic) → `CloudDiskKitTests`, 319 cases, run with
+  `swift test --package-path CloudDiskKit`.
+- A registered domain, when one exists → `DomainCacheSmokeTests` asks the real system what it holds and
+  where it lives, read-only, with a deadline so an unresponsive `fileproviderd` skips rather than hangs.
+  It skips unless the calling process can see a CloudDisk domain, which a command-line test binary
+  cannot on this machine.
+- File Provider behaviour that needs `fileproviderd` → launch validation on this Mac, recorded
+  per-item in `docs/KNOWN_LIMITATIONS.md`. Anything not actually run is marked unverified, never
+  "passing".

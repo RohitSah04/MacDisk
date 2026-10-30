@@ -59,11 +59,26 @@ final class AppCore: ObservableObject {
         case unavailable(String)
     }
 
+    /// What CloudDisk's Finder location occupies on this Mac.
+    ///
+    /// The numbers come from File Provider's own materialized set and from the file system, not from a
+    /// CloudDisk ledger — so `.loaded` with an empty inventory really does mean nothing is on disk.
+    enum LocalCache: Equatable {
+        case unknown
+        case loading
+        case loaded(CacheInventory)
+        case unavailable(String)
+    }
+
     @Published private(set) var account: Account = .unknown
     @Published private(set) var location: FinderLocation = .unknown
     @Published private(set) var credentialStorage: CredentialStorage = .unknown
     @Published private(set) var extensionStatus: ExtensionStatus = .unknown
     @Published private(set) var storage: Storage = .unknown
+    @Published private(set) var localCache: LocalCache = .unknown
+    /// The result of the last "clear cached files" run, kept until the next one so the button can say
+    /// what the system refused rather than only that it finished.
+    @Published private(set) var lastEviction: EvictionReport?
     @Published private(set) var activity: [ProviderState.ActivityEvent] = []
     @Published private(set) var configurationProblem: String?
 
@@ -111,6 +126,7 @@ final class AppCore: ObservableObject {
         checkKeychain()
         await registerLocation()
         await refreshStorage()
+        await refreshLocalCache()
         await refreshActivity()
         await verifyExtension()
     }
@@ -302,6 +318,56 @@ final class AppCore: ObservableObject {
     func refreshActivity() async {
         guard let state = services?.state else { activity = []; return }
         activity = await state.recentActivity(limit: 12)
+    }
+
+    // MARK: Local cache
+
+    /// Asks Finder what it is holding for CloudDisk and measures those paths. Needs no Drive access:
+    /// a signed-out user can still see and free what the last session left on disk.
+    func refreshLocalCache() async {
+        guard let services else { return }
+        localCache = .loading
+        do {
+            localCache = .loaded(try await services.offline.inventory())
+        } catch {
+            localCache = .unavailable(error.localizedDescription)
+        }
+    }
+
+    /// Frees every cached file the user has not asked to keep offline.
+    ///
+    /// The system has the last word — a document open in another app stays — so this reports what came
+    /// back rather than assuming the bytes are gone, and re-measures afterwards.
+    func clearLocalCache() async {
+        guard let services else { return }
+        localCache = .loading
+        do {
+            lastEviction = try await services.offline.releaseEligibleItems()
+        } catch {
+            lastEviction = nil
+            localCache = .unavailable(error.localizedDescription)
+            await refreshActivity()
+            return
+        }
+        await refreshLocalCache()
+        await refreshActivity()
+    }
+
+    /// Sets or clears one object's "keep offline" mark. Used by the file browser; the answer is
+    /// returned so the caller can say plainly whether the bytes are on their way.
+    @discardableResult
+    func setKeepOffline(_ file: DriveFile, pinned: Bool) async -> PinOutcome? {
+        guard let services else { return nil }
+        let outcome = await services.offline.setPinned(file, pinned: pinned)
+        await refreshLocalCache()
+        await refreshActivity()
+        return outcome
+    }
+
+    /// The marks CloudDisk's own browser shows, read from the same file the extension enumerates from.
+    func pinnedDriveIDs() async -> Set<String> {
+        guard let state = services?.state else { return [] }
+        return await state.pinnedDriveIDs()
     }
 }
 
