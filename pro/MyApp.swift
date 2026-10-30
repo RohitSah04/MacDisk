@@ -8,7 +8,7 @@ struct CloudDiskApp: App {
 
     var body: some Scene {
         WindowGroup("CloudDisk") {
-            ContentView(core: core)
+            RootView(core: core)
                 .task {
                     await core.prepare()
                 }
@@ -17,6 +17,6 @@ struct CloudDiskApp: App {
                     _ = GIDSignIn.sharedInstance.handle(url)
                 }
         }
-        .defaultSize(width: 940, height: 660)
+        .defaultSize(width: 1080, height: 700)
     }
 }

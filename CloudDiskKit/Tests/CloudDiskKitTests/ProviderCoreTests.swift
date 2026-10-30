@@ -1701,7 +1701,7 @@ private final class TrashParentTemplate: NSObject, NSFileProviderItem {
 
     var itemIdentifier: NSFileProviderItemIdentifier { underlying.itemIdentifier }
     var parentItemIdentifier: NSFileProviderItemIdentifier { .trashContainer }
-    var filename: String { underlying.filename ?? "" }
+    var filename: String { underlying.filename }
     var contentType: UTType { underlying.contentType ?? .data }
     var capabilities: NSFileProviderItemCapabilities { underlying.capabilities ?? [] }
     var itemVersion: NSFileProviderItemVersion {
@@ -1720,10 +1720,8 @@ private final class ContentTypeTemplate: NSObject, NSFileProviderItem {
     }
 
     var itemIdentifier: NSFileProviderItemIdentifier { underlying.itemIdentifier }
-    var parentItemIdentifier: NSFileProviderItemIdentifier {
-        underlying.parentItemIdentifier ?? .init("ignored")
-    }
-    var filename: String { underlying.filename ?? "alias" }
+    var parentItemIdentifier: NSFileProviderItemIdentifier { underlying.parentItemIdentifier }
+    var filename: String { underlying.filename }
     var contentType: UTType { type }
     var capabilities: NSFileProviderItemCapabilities { underlying.capabilities ?? [] }
     var itemVersion: NSFileProviderItemVersion {

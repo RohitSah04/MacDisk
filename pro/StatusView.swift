@@ -2,12 +2,12 @@ import AppKit
 import CloudDiskKit
 import SwiftUI
 
-/// CloudDisk's status window.
+/// CloudDisk's status screen: the one place that says whether the pieces the user cannot see are up.
 ///
 /// Every value here is read from the running system: the credential in the shared keychain, the
 /// domain registered with File Provider, the quota returned by Drive, and the activity log the
 /// extension writes. Nothing is simulated, so a green row means that part actually works.
-struct ContentView: View {
+struct StatusView: View {
     @ObservedObject var core: AppCore
 
     var body: some View {
@@ -153,7 +153,7 @@ struct ContentView: View {
             }
         case .live(let at):
             Row(title: "File Provider extension", systemImage: "checkmark.circle.fill", tint: .green,
-                detail: "Serving this build — last answer \(at.formatted(.relative(presentation: .named))).") {
+                detail: "Serving this build — last answer \(DateText.relative(at)).") {
                 EmptyView()
             }
         case .servedByOtherBuild(let path):
@@ -229,13 +229,11 @@ struct ContentView: View {
     }
 
     private func usageText(used: Int64?, limit: Int64?, accountName: String?) -> String {
-        let formatter = ByteCountFormatter()
-        formatter.countStyle = .file
         var text: String
         if let used, let limit, limit > 0 {
-            text = "\(formatter.string(fromByteCount: used)) of \(formatter.string(fromByteCount: limit)) used"
+            text = "\(SizeText.bytes(used)) of \(SizeText.bytes(limit)) used"
         } else if let used {
-            text = "\(formatter.string(fromByteCount: used)) used"
+            text = "\(SizeText.bytes(used)) used"
         } else {
             text = "Drive did not report a usage figure."
         }
@@ -293,9 +291,7 @@ struct ContentView: View {
         guard inventory.fileCount > 0 else {
             return "Finder is holding no CloudDisk file on this Mac — everything is online-only."
         }
-        let formatter = ByteCountFormatter()
-        formatter.countStyle = .file
-        var text = "\(formatter.string(fromByteCount: inventory.materializedBytes)) in "
+        var text = "\(SizeText.bytes(inventory.materializedBytes)) in "
             + "\(inventory.fileCount) file\(inventory.fileCount == 1 ? "" : "s")"
         if inventory.folderCount > 0 {
             text += " across \(inventory.folderCount) folder\(inventory.folderCount == 1 ? "" : "s")"
@@ -311,15 +307,13 @@ struct ContentView: View {
 
     /// What the last "clear cached files" run achieved, including what Finder refused and why.
     private func evictionText(_ report: EvictionReport) -> String {
-        let formatter = ByteCountFormatter()
-        formatter.countStyle = .file
         var lines: [String] = []
         if report.released.isEmpty {
             lines.append("Nothing was eligible to free")
         } else {
             var freed = "Freed \(report.released.count) file"
                 + (report.released.count == 1 ? "" : "s")
-                + " (\(formatter.string(fromByteCount: report.freedBytes)))"
+                + " (\(SizeText.bytes(report.freedBytes)))"
             if report.unmeasuredReleasedCount > 0 {
                 freed += ", \(report.unmeasuredReleasedCount) size"
                     + (report.unmeasuredReleasedCount == 1 ? "" : "s") + " unknown"
@@ -367,109 +361,13 @@ struct ContentView: View {
                             }
                         }
                         Spacer(minLength: 8)
-                        Text(event.date.formatted(.relative(presentation: .named)))
+                        Text(DateText.relative(event.date))
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
                     .padding(.vertical, 3)
                 }
             }
-        }
-    }
-}
-
-// MARK: - Building blocks
-
-private struct Card<Content: View>: View {
-    let title: String
-    @ViewBuilder var content: Content
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            Text(title.uppercased())
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
-                .padding(.bottom, 10)
-            content
-        }
-        .padding(18)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
-        .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(.separator, lineWidth: 1))
-    }
-}
-
-private struct Row<Trailing: View>: View {
-    private let title: String
-    private let systemImage: String
-    private let tint: Color
-    private let detail: String?
-    private let trailing: Trailing
-
-    init(title: String, systemImage: String, tint: Color, detail: String?,
-         @ViewBuilder trailing: () -> Trailing) {
-        self.title = title
-        self.systemImage = systemImage
-        self.tint = tint
-        self.detail = detail
-        self.trailing = trailing()
-    }
-
-    var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 12) {
-            Image(systemName: systemImage)
-                .foregroundStyle(tint)
-                .frame(width: 18)
-            VStack(alignment: .leading, spacing: 3) {
-                Text(title)
-                if let detail, !detail.isEmpty {
-                    Text(detail)
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                        .textSelection(.enabled)
-                }
-            }
-            Spacer(minLength: 12)
-            trailing
-        }
-        .padding(.vertical, 8)
-    }
-}
-
-private extension ProviderState.ActivityEvent.Kind {
-    var phrase: String {
-        switch self {
-        case .download: return "Downloaded"
-        case .upload: return "Uploaded"
-        case .create: return "Created"
-        case .rename: return "Renamed"
-        case .move: return "Moved"
-        case .copy: return "Copied"
-        case .delete: return "Deleted"
-        case .synchronize: return "Synced"
-        case .signIn: return "Connected"
-        case .signOut: return "Signed out of"
-        case .pin: return "Kept offline"
-        case .unpin: return "Released offline"
-        case .other: return "Recorded"
-        }
-    }
-}
-
-private extension ProviderState.ActivityEvent.Outcome {
-    var systemImage: String {
-        switch self {
-        case .success: return "checkmark.circle.fill"
-        case .failure: return "xmark.circle.fill"
-        case .cancelled: return "slash.circle"
-        }
-    }
-
-    var tint: Color {
-        switch self {
-        case .success: return .green
-        case .failure: return .red
-        case .cancelled: return .secondary
         }
     }
 }

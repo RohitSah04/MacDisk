@@ -55,6 +55,26 @@ The extension target is a thin shim: `CloudDiskProvider/FileProviderExtension.sw
 `NSExtensionPrincipalClass` has to name a class in the extension's own binary. The agent, and every
 method it implements, lives in the package, so the whole provider is testable without `fileproviderd`.
 
+## App target layout
+
+The app is the only place a user can see what the two background processes are doing, so every screen
+here reads a fact from one of them — the keychain, File Provider's store, Drive's own listing, or the
+activity log the extension writes — and renders an explanation when the fact is missing. There is no
+screen with data the app invented.
+
+| File | Responsibility |
+| --- | --- |
+| `MyApp.swift` | The `App` scene, the shared `AppCore`, the OAuth redirect handed to `GIDSignIn.handle` |
+| `AppCore.swift` | Observable app state: account, domain registration, extension liveness, credential sharing, Drive quota, local cache inventory, last eviction, recent activity; owns `ProviderServices` |
+| `RootView.swift` | `NavigationSplitView` with the three sections; owns the `FileBrowser` so folder navigation survives a trip to the status screen |
+| `StatusView.swift` | Setup checklist — one row per piece the user cannot see, each with the real value and the action that fixes it |
+| `FileBrowser.swift` | The Drive listing as view model: trail, pagination, search, pins, rename/trash, reveal-in-Finder, open-with-default-app, and a ticket counter so a page that arrives after the user moved on is dropped |
+| `FilesView.swift` | The listing itself: breadcrumbs, rows, context menu, rename sheet, preview and player sheets, status bar |
+| `PlayerView.swift` | Byte-range playback through `AVPlayer` + `DriveAssetResourceLoader`; keeps the loader alive because the asset holds it weakly |
+| `PreviewView.swift` | Quick Look via `QLPreviewView` (`import Quartz` — macOS has no `QLPreviewViewController`), pointed at the File Provider path so the system materializes what it needs |
+| `ActivityView.swift` | The extension's own log, read from the shared container, with nothing added by the app |
+| `SharedViews.swift` | `Card`, `Row`, and the `SizeText` / `DateText` formatters the screens share |
+
 ## Authentication
 
 - Sign-in uses `GIDSignIn` (app target only) with

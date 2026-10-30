@@ -4,7 +4,9 @@ import Foundation
 ///
 /// Drive returns camelCase JSON, so the synthesized `Decodable` conformance maps directly.
 /// `size` is a string in the v3 API (uint64 can exceed JSON number precision).
-public struct DriveFile: Decodable, Equatable, Sendable {
+/// `Identifiable` because both File Provider and every list in the app key a row by Drive's object id,
+/// which is stable across a rename — `id` is already that value.
+public struct DriveFile: Decodable, Equatable, Sendable, Identifiable {
 
     public let kind: String?
     public let id: String

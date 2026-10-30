@@ -340,7 +340,73 @@ file pinned in Finder is invisible to CloudDisk's list and vice versa.
 
 ## Phase 7 — Production UI
 
-Dashboard / Account / Storage / Activity / browser / player against live data. Demo rows deleted.
+**Built, and every screen looked at while the app was running** (319 tests, 17 skipped, 0 failures;
+`xcodebuild -scheme CloudDisk` green and warning-free). The single status window became a
+`NavigationSplitView` with three sections. Nothing on any of them is a demo row: each value is read from
+the keychain, from File Provider, from Drive, or from the log the extension writes, and each missing
+value says why it is missing.
+
+| Screen | File | What it shows |
+| --- | --- | --- |
+| Status | `pro/StatusView.swift` (was `ContentView.swift`) | Six rows — account, Finder location, extension liveness, credential sharing, Drive quota, local cache — each with the real figure and the one button that can fix it, plus the extension's recent activity |
+| Files | `pro/FilesView.swift` + `pro/FileBrowser.swift` | Drive's own listing, not a second index: breadcrumbs, folder navigation, pagination ("Load more"), `searchable` search, keep-offline marks read from the shared pin set, and a context menu for open / preview / play / reveal in Finder / keep offline / rename / move to trash |
+| Activity | `pro/ActivityView.swift` | The whole log the extension writes into the App Group (up to 200 lines), read the same way the status card reads it — a download that is not in there did not happen |
+| Preview | `pro/PreviewView.swift` | Quick Look pointed at the File Provider path for one object, so the system materializes what the preview needs |
+| Player | `pro/PlayerView.swift` | `AVPlayer` over `DriveAssetResourceLoader` + `DriveRangeReader` — seeking is a range request, no local copy |
+
+Two decisions that shaped the code rather than the pixels. `FileBrowser` is owned by `RootView`, not by
+`FilesView`, because the folder the user was standing in belongs to the window and not to whichever
+sidebar row is selected; and the browser drops a page that arrives after the user has moved on via a
+ticket counter, so a slow Drive response cannot repaint a folder the user has already left. A failed
+listing keeps the rows already on screen and says so in the status bar, rather than replacing real
+content with an error.
+
+**What was run against the real system.** The built app was launched, and all three screens were
+captured and read:
+
+- Status rendered every row from live state — Finder location green at
+  `/Users/rohitsah/Library/CloudStorage/CloudDisk-CloudDisk`, "File Provider extension — Serving this
+  build — last answer 4 minutes ago", credential sharing green, quota and account both saying plainly
+  that no Google account is connected, and the local-cache row reading "Finder is holding no CloudDisk
+  file on this Mac — everything is online-only" with "Clear cached files" disabled.
+- Files rendered its signed-out state: the "My Drive" breadcrumb, the toolbar's up/refresh pair disabled,
+  the search field present, and a `ContentUnavailableView` that names the missing dependency instead of
+  showing an empty table.
+- Activity rendered its empty state, and reading the shared container confirmed the empty state is true
+  rather than a read failure: activity lines are written only by real data operations (`download`,
+  `upload`, `create`, `rename`, `move`, `copy`, `delete`, `synchronize`, `pin`, `unpin`), and on this
+  machine none has ever run against a Drive object.
+- The app was then **quit and relaunched**, and the new process found the same domain still mounted and
+  still served by the same build. That is an app-restart test, not a machine-reboot test — see below.
+
+**Defects found by looking at the screenshots, not by the compiler.** Both were layout, and both were
+invisible in a preview:
+
+1. `FilesView`'s `VStack` floated in the vertical middle of the window. The listing area kept its
+   intrinsic height, so a signed-out browser left the breadcrumb and the status bar sandwiching the
+   empty state in mid-air. The first fix — a flexible frame on the whole stack — made the stack fill the
+   window and still centered its contents; the frame belongs on the listing, so the listing takes the
+   slack and the breadcrumb sits at the top. Confirmed by a second capture.
+2. `ActivityView`'s empty state was a row inside the `List`, which reads as one more entry rather than
+   as the absence of entries. It is now an overlay over the list area.
+
+Also folded in while the screens were being separated: the relative-date formatting that three screens
+each spelled their own way now lives in `DateText`, `DriveFile`'s `Identifiable` conformance moved to
+the type that owns it (an app-side extension of two imported types warns), and the `AVPlayerItem` status
+observation moved off KVO — a `Task { @MainActor in self?… }` inside a KVO handler warns about capturing
+`self` concurrently, and `status` is not an async-loadable property on `AVPlayerItem`, so it is a
+Combine publisher with a cancellable held by the model.
+
+**Not verified and not claimable here.** The Files screen has never listed a real Drive folder, so none
+of this has been seen to work: rows, entering a folder, "Load more" across a second page, search, the
+context-menu actions, the rename sheet, keep-offline from the browser, reveal-in-Finder, open-with-default-app.
+The preview sheet has never been opened and `QLPreviewView` has never been handed a URL — including the
+question of whether the app's sandbox lets Quick Look read a File Provider path at all. The player has
+never played: no object, no range request, no seek. `FileBrowser`'s logic (pagination, the stale-page
+ticket, pin refresh, the outcome sentences) has **no test coverage of any kind**, because it lives in the
+app target and there is no app-target test bundle yet — that is Phase 8's first task. Unchanged from
+Phase 6 and still true: the domain surviving an *app* relaunch is not the same claim as surviving a
+*machine* reboot, and this machine was never rebooted with the domain mounted.
 
 ## Phase 8 — Validation
 
