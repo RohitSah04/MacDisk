@@ -1,5 +1,8 @@
 build/
+.build/
 DerivedData/
 *.xcuserstate
 xcuserdata/
 .DS_Store
+.build/
+CloudDiskKit/.build/
