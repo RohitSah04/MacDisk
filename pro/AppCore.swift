@@ -215,14 +215,7 @@ final class AppCore: ObservableObject {
         location = .registering
         switch await CloudDiskDomain.register(domain) {
         case .registered:
-            var mountedAt = await CloudDiskDomain.userVisibleURL(for: domain)
-            if mountedAt == nil {
-                // Mounting is asynchronous, so one short retry keeps a domain that is coming up from
-                // being reported as absent.
-                try? await Task.sleep(for: .milliseconds(600))
-                mountedAt = await CloudDiskDomain.userVisibleURL(for: domain)
-            }
-            location = .registered(url: mountedAt)
+            await reportRegistered()
         case .storageLocationOccupied:
             location = .blocked("""
             Finder already has a folder where CloudDisk wants to mount, but no CloudDisk domain is \
@@ -230,8 +223,29 @@ final class AppCore: ObservableObject {
             CloudDisk folder in ~/Library/CloudStorage, then register again.
             """)
         case .failed(let message):
-            location = .blocked(message)
+            // `addDomain` also refuses when a record exists for the identifier but the app copy that
+            // created it is gone — which is what an update that moved or deleted the old bundle
+            // leaves behind. Re-adding cannot fix that, so this is the one place repair is reached
+            // from a location that does not report itself registered; without it "Register again"
+            // could never succeed.
+            switch await CloudDiskDomain.repair(domain) {
+            case .reregistered:
+                await reportRegistered()
+            case .failed(let repairMessage):
+                location = .blocked("\(message) \(repairMessage)")
+            }
         }
+    }
+
+    /// Mounting is asynchronous, so one short retry keeps a domain that is coming up from being
+    /// reported as absent.
+    private func reportRegistered() async {
+        var mountedAt = await CloudDiskDomain.userVisibleURL(for: domain)
+        if mountedAt == nil {
+            try? await Task.sleep(for: .milliseconds(600))
+            mountedAt = await CloudDiskDomain.userVisibleURL(for: domain)
+        }
+        location = .registered(url: mountedAt)
     }
 
     func refreshLocation() async {

@@ -75,14 +75,24 @@ public enum CloudDiskDomain {
         case failed(userMessage: String)
     }
 
+    /// Removes the domain, keeping whatever the user had downloaded in a location the caller can
+    /// report.
+    ///
+    /// The removal is attempted whether or not `domains()` lists the domain. A record whose owning app
+    /// copy has been moved or deleted is exactly the case that needs removing, and it is also a case
+    /// where the daemon can no longer enumerate domains for that provider (`FP -2001`), so a listing
+    /// check first would answer "not registered" and leave the unusable record in place forever.
     @discardableResult
     public static func unregister(_ domain: NSFileProviderDomain = CloudDiskDomain.make()) async -> RemovalOutcome {
-        guard await isRegistered(identifier: domain.identifier.rawValue) else { return .notRegistered }
+        let listed = await isRegistered(identifier: domain.identifier.rawValue)
         do {
             let preserved = try await NSFileProviderManager.remove(domain,
                                                                    mode: .preserveDownloadedUserData)
             return .removed(preservedItemsAt: preserved)
         } catch {
+            if !listed, let fpError = error as? NSFileProviderError, fpError.code == .noSuchItem {
+                return .notRegistered
+            }
             return .failed(userMessage: (error as NSError).localizedDescription)
         }
     }

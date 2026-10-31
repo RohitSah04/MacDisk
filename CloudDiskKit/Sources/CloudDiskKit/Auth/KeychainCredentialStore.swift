@@ -70,26 +70,33 @@ public struct KeychainCredentialStore: CredentialStore {
 
     public func save(_ credential: GoogleCredential) throws {
         let data = try JSONEncoder().encode(credential)
-        var query = baseQuery
-        query[kSecValueData as String] = data
-        query[kSecAttrLabel as String] = "CloudDisk Google Drive credential"
+
+        // Only fields that can actually change belong in here. `SecItemUpdate` treats its second
+        // dictionary as the new values, and the data-protection keychain answers `errSecNoSuchAttr`
+        // (-25303) for a class, a service, an account, an access group or the
+        // `kSecUseDataProtectionKeychain` call option — and it answers that even when no item
+        // matches, where `errSecItemNotFound` is what lets the insert below run. Passing the query
+        // template through instead of these two fields made every first sign-in fail.
+        let mutableAttributes: [String: Any] = [
+            kSecValueData as String: data,
+            kSecAttrLabel as String: "CloudDisk Google Drive credential"
+        ]
+
+        var addQuery = baseQuery
+        addQuery[kSecValueData as String] = data
+        addQuery[kSecAttrLabel as String] = "CloudDisk Google Drive credential"
         // The extension must be able to read the credential after a reboot, without the app ever
         // having been launched in that boot session.
-        query[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-
-        var attributes = baseQuery
-        attributes[kSecValueData as String] = data
-        attributes[kSecAttrLabel as String] = "CloudDisk Google Drive credential"
+        addQuery[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
 
         // Update first, insert on miss: keeps the operation idempotent when both processes sign in
         // around the same time.
-        let updateStatus = SecItemUpdate(baseQuery as CFDictionary,
-                                        attributes as CFDictionary)
+        let updateStatus = SecItemUpdate(baseQuery as CFDictionary, mutableAttributes as CFDictionary)
         switch updateStatus {
         case errSecSuccess:
             return
         case errSecItemNotFound:
-            let addStatus = SecItemAdd(query as CFDictionary, nil)
+            let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
             guard addStatus == errSecSuccess else {
                 // A second process can win the race between the update and the add. Treat the
                 // duplicate as success, since the stored value is the one we just wrote elsewhere.
