@@ -1,7 +1,7 @@
 import Foundation
 import XCTest
 import FileProvider
-@testable import CloudDiskKit
+import CloudDiskKit
 
 /// The one layer of the cache that a scripted `CacheSystem` cannot prove: the real calls to
 /// `fileproviderd`.
@@ -11,14 +11,16 @@ import FileProvider
 /// covers `FileProviderCacheSystem`'s two answering calls and the inventory built on top of them, and
 /// nothing else.
 ///
-///     swift test --filter DomainCacheSmokeTests
+/// These cases live in the **app's own test bundle** for one reason: `NSFileProviderManager.domains()`
+/// answers for the calling process, so a command-line test binary sees no CloudDisk location even while
+/// the built app has one mounted. A hosted bundle runs inside `CloudDisk.app`, which holds the App Group
+/// and the domain, so this is the first context where the question "what is Finder holding?" can really
+/// be asked.
 ///
-/// Skipped — never "passed" — when this process cannot see a CloudDisk domain. That is not the same
-/// question as "is a domain registered": `NSFileProviderManager.domains()` answers for the calling
-/// process, so a command-line test binary sees none even while the built app has one mounted — which is
-/// what happens on this machine, and why the read paths are recorded as verified by the running app
-/// rather than by this suite. Running these cases for real belongs to an app-target test, where the
-/// bundle's entitlements are the process's own.
+///     xcodebuild -scheme CloudDisk -destination platform=macOS test
+///
+/// Still a skip rather than a pass when no domain is registered — on a machine that has never launched
+/// CloudDisk, or after the user removed the location, there is nothing to ask.
 final class DomainCacheSmokeTests: XCTestCase {
 
     /// Which domain is registered is an async question, so it is asked per case rather than in
@@ -29,10 +31,9 @@ final class DomainCacheSmokeTests: XCTestCase {
             $0.identifier.rawValue == CloudDiskConfig.domainIdentifierValue
         }) ?? domains.first(where: { $0.displayName == CloudDiskConfig.displayName }) else {
             throw XCTSkip("""
-            This process sees no CloudDisk Finder location, so the real materialized-items \
-            enumerator, getUserVisibleURL and the inventory over them are not exercised here. \
-            The domain may well be mounted — `domains()` answers per process, and a command-line \
-            test binary holds none of the app's entitlements. Run this suite from an app target.
+            This process sees no CloudDisk Finder location. If this run is really hosted by \
+            CloudDisk.app, the domain was never registered on this machine — register it by \
+            launching the app, then run again.
             """)
         }
         guard let manager = NSFileProviderManager(for: domain) else {

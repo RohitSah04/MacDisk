@@ -75,6 +75,9 @@ screen with data the app invented.
 | `ActivityView.swift` | The extension's own log, read from the shared container, with nothing added by the app |
 | `SharedViews.swift` | `Card`, `Row`, and the `SizeText` / `DateText` formatters the screens share |
 
+Next to the app sources, the `CloudDiskTests/` directory is the app target's hosted test bundle —
+the cases that must run inside the app's own process to see its File Provider domain.
+
 ## Authentication
 
 - Sign-in uses `GIDSignIn` (app target only) with
@@ -263,12 +266,17 @@ Three seams, each one there because some part of the system cannot be reached fr
   activity log really are cross-process state rather than process memory.
 
 - Pure logic (Drive service, token provider, query escaping, page/anchor encoding, item mapping, error
-  taxonomy, write permissions, cache arithmetic) → `CloudDiskKitTests`, 319 cases, run with
+  taxonomy, write permissions, cache arithmetic) → `CloudDiskKitTests`, 316 cases, run with
   `swift test --package-path CloudDiskKit`.
-- A registered domain, when one exists → `DomainCacheSmokeTests` asks the real system what it holds and
-  where it lives, read-only, with a deadline so an unresponsive `fileproviderd` skips rather than hangs.
-  It skips unless the calling process can see a CloudDisk domain, which a command-line test binary
-  cannot on this machine.
+- A registered domain, when one exists → the app's hosted bundle `CloudDiskTests`
+  (`xcodebuild -scheme CloudDisk -destination platform=macOS test`). `NSFileProviderManager.domains()`
+  answers for the calling process, so these cases run inside `CloudDisk.app`, which holds the App
+  Group and the domain: `DomainCacheSmokeTests` asks the real system what it holds and where it lives,
+  read-only, with a deadline so an unresponsive `fileproviderd` skips rather than hangs;
+  `DomainPersistenceTests` checks the domain's identity, uniqueness, mounted path and the
+  served-by-this-build heartbeat; `FileBrowserSentenceTests` pins the "keep offline" wording. The
+  bundle links no packages of its own — a hosted bundle statically linking the same product as its
+  host duplicates the library — so `import CloudDiskKit` resolves through the host app.
 - File Provider behaviour that needs `fileproviderd` → launch validation on this Mac, recorded
   per-item in `docs/KNOWN_LIMITATIONS.md`. Anything not actually run is marked unverified, never
   "passing".

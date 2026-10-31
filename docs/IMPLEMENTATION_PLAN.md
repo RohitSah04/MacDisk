@@ -403,15 +403,63 @@ context-menu actions, the rename sheet, keep-offline from the browser, reveal-in
 The preview sheet has never been opened and `QLPreviewView` has never been handed a URL — including the
 question of whether the app's sandbox lets Quick Look read a File Provider path at all. The player has
 never played: no object, no range request, no seek. `FileBrowser`'s logic (pagination, the stale-page
-ticket, pin refresh, the outcome sentences) has **no test coverage of any kind**, because it lives in the
-app target and there is no app-target test bundle yet — that is Phase 8's first task. Unchanged from
+ticket, pin refresh, the outcome sentences) had **no test coverage of any kind** at this point, because
+it lived in the app target and no app-target test bundle existed; Phase 8's bundle covers the sentence
+wording and the `succeeded` agreement, not this logic. Unchanged from
 Phase 6 and still true: the domain surviving an *app* relaunch is not the same claim as surviving a
 *machine* reboot, and this machine was never rebooted with the domain mounted.
 
 ## Phase 8 — Validation
 
-New `CloudDiskTests` target, full test run, launch test for Finder persistence, everything else
-marked unverified with the reason.
+**A hosted test bundle exists, and the checks that skipped for two phases now run.** `CloudDiskTests`
+(`com.apple.product-type.bundle.unit-test`, TEST_HOST `CloudDisk.app`) is the app target's own bundle:
+`NSFileProviderManager.domains()` answers for the calling process, so a test has to run inside the app
+that holds the App Group and the domain. `DomainCacheSmokeTests` moved here from the package for
+exactly that reason and — with the domain registered by this build — **passed for the first time**: the
+materialized set answered, every path the system named was really on disk, and the inventory was
+internally consistent. The bundle is not part of `swift test`; run it with
+`xcodebuild -scheme CloudDisk -destination platform=macOS test`.
+
+`DomainPersistenceTests` (read-only: it skips rather than repairing what it is checking) asserts what
+the status screen claims in words — the registered domain still carries `CloudDiskConfig`'s display
+name and trash flag; there is only one location of that name; the mounted root really is under
+`~/Library/CloudStorage` and really exists; and the extension that answered the heartbeat lives inside
+this build, which is the check that catches the stale-bundle hazard this project actually hit.
+
+`FileBrowserSentenceTests` covers the one piece of the browser a hosted bundle reaches without
+credentials: the five "keep offline" outcome sentences stay distinguishable, the two refusals do not
+read as kept promises, the sentences agree with `PinOutcome.succeeded` (a disagreement would show a
+green checkmark over a failure), and unpinning says the bytes *may go* rather than that they stayed.
+
+**Getting the bundle to build cost two fixes worth recording:**
+
+1. A hosted test bundle may not also statically link the same package product as its host ("This will
+   result in duplication of library code"), so the test target links no packages at all —
+   `import CloudDiskKit` resolves through the host app's own linked product.
+2. `PinOutcome` was a public type with an internal memberwise initializer, so no client could ever
+   construct it; it now has a public `init(pinned:effect:)`, matching the other public values in
+   `OfflineStore.swift`.
+
+**One real defect, and it was in the test, not the product.** The mounted-path case first compared the
+system's answer against `FileManager.homeDirectoryForCurrentUser` — which in the sandboxed test host
+is `~/Library/Containers/dev.rohitsah.clouddisk/Data`, not the user's home. The system's answer,
+`~/Library/CloudStorage/CloudDisk-CloudDisk`, was the correct one; the test now resolves the real home
+from the password database. Recorded because "the test failed" and "the assertion was written against
+the wrong home" are different facts, and only the second is a defect.
+
+**What was run.** `swift test --package-path CloudDiskKit` → 316 tests, 14 skipped (live Drive),
+0 failures — three fewer than Phase 7 because the smoke cases moved to the hosted bundle.
+`xcodebuild -scheme CloudDisk -destination platform=macOS test` → **11 tests, 0 skipped, 0
+failures** — zero skips means the domain was registered, mounted, and served by this build for every
+assertion. The whole-app build is green and warning-free.
+
+**Still not verified, and green tests do not change that.** The domain surviving an *app* relaunch —
+every `xcodebuild test` launches a freshly built host over a domain registered by an earlier one — is
+still not a *machine reboot*, which was never done. The smoke tests see the materialized set as one
+page; the enumerator's pagination beyond the first remains assumed. `FileBrowser`'s remaining logic —
+pagination, the stale-page ticket, pin refresh, the rename/move context actions — is still untested,
+and the Files screen itself has still never listed a real Drive folder: covered sentences are wording,
+not behaviour.
 
 ## Phase 9 — Release
 

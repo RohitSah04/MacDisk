@@ -131,6 +131,11 @@ public struct PinOutcome: Sendable, Equatable {
     public var pinned: Bool
     public var effect: Effect
 
+    public init(pinned: Bool, effect: Effect) {
+        self.pinned = pinned
+        self.effect = effect
+    }
+
     /// Whether the user's intent is actually in effect, which is what the activity log records.
     public var succeeded: Bool {
         switch effect {
