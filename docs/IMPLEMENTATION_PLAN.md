@@ -463,8 +463,30 @@ not behaviour.
 
 ## Phase 9 — Release
 
-`.app` artifact, DMG if signing allows, install/OAuth/test/limitation/release-checklist docs, final
-report.
+**Packaged, and the packaging is honest about what it is.** `dist/CloudDisk.app` is the Release
+configuration build (green; the only log warnings are the two AppIntents metadata-processor notices
+any non-AppIntents app gets), copied out of DerivedData with `ditto` so the signature survives, plus
+`dist/CloudDisk.dmg` — UDZO image with the app and an `/Applications` symlink. Both the app and the
+`CloudDiskProvider.appex` inside it pass `codesign --verify --deep --strict`.
+
+The signature is an **Apple Development** certificate, because that is the only identity on this
+machine. `codesign -dv` confirms it; `spctl -a` **rejects** the bundle, so it is not a supported
+distribution outside the build machine — the docs say this in those words, and the DMG exists
+because creating it is harmless, not because it makes the app installable elsewhere.
+
+Docs written: `docs/INSTALL.md` (install, what the app touches, uninstall — including the
+`NSFileProviderManager.remove` one-liner, explicitly marked *not run here* because running it would
+unregister the machine's live domain; the `fileproviderctl` on this macOS has no `remove` verb, which
+the first draft of that section wrongly assumed), `docs/OAUTH_SETUP.md` (the baked-in client id, the
+consent-screen checklist, the test-user trap, the live-test variables), `docs/TESTING.md` (the three
+automated surfaces with their real numbers, and the ten-step human checklist that no machine can run
+without credentials), `docs/RELEASE_CHECKLIST.md` (rebuild commands, verification gates, and the
+Developer-ID/notarization steps that need assets this machine lacks), `docs/RELEASE_NOTES.md` (the
+final report: verified, not verified, distribution status, how to proceed), and a root `README.md`
+pointing at all of it.
+
+`dist/` is gitignored: the artifacts are on disk at `dist/`, and the repo carries the recipe that
+reproduces them rather than the binaries.
 
 ## Known hard dependencies on the user
 
