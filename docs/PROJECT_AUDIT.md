@@ -11,7 +11,7 @@ prototype before production work"), before any production change.
 | Swift | 6.4 (swiftlang-6.4.0.34.1) |
 | macOS SDK | MacOSX27.0.sdk |
 | Deployment target (both targets) | `MACOSX_DEPLOYMENT_TARGET = 27.0` |
-| Signing identity available | `Apple Development: rohitsumit0231@gmail.com (KH9867DZLR)` — development only, no Developer ID |
+| Signing identity available | an Apple Development certificate — development only, no Developer ID |
 | Development team | `59YP46BFR2` (automatic signing) |
 
 Baseline build command that succeeds today:

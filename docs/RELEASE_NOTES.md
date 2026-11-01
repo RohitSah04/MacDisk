@@ -35,7 +35,7 @@ is no parallel CloudDisk cache fighting File Provider for disk.
   demand, create/write/rename/move/duplicate/delete through the mount, out-of-band sync measured five
   ways, and pinning with eviction. It found eleven defects, all fixed in the tested binary.
 - **The Finder location on this machine** — the app registered the domain, Finder shows it at
-  `/Users/rohitsah/Library/CloudStorage/CloudDisk-CloudDisk`, the extension answering the heartbeat
+  `~/Library/CloudStorage/CloudDisk-CloudDisk`, the extension answering the heartbeat
   lives inside this build, and the 14 hosted tests in `CloudDiskTests` assert the domain identity,
   its uniqueness, the mounted path, the served-by-this-build fact and the real keychain save path on
   every run (`xcodebuild -scheme CloudDisk test`).

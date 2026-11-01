@@ -64,12 +64,12 @@ final class ProviderIdentityTests: XCTestCase {
         // folder by its real id. An item parented to an identifier the system was never given belongs
         // to no container, and Finder shows an empty folder while the API returns every file.
         let topLevel = DriveFile(id: "1234567890abcdefghijklmnopqrstuv", name: "top.txt",
-                                 mimeType: "text/plain", parents: ["0AIzEQ6JILNiUk9PVAxxxxxxxxxxxxx"])
+                                 mimeType: "text/plain", parents: ["FAKEMyDriveFolderID0000000000000000"])
         XCTAssertEqual(ProviderIdentity.parentIdentifier(for: topLevel),
-                       ProviderIdentity.identifier(forDriveID: "0AIzEQ6JILNiUk9PVAxxxxxxxxxxxxx"),
+                       ProviderIdentity.identifier(forDriveID: "FAKEMyDriveFolderID0000000000000000"),
                        "without the alias the item is filed under a container nobody asked for")
         XCTAssertEqual(ProviderIdentity.parentIdentifier(for: topLevel,
-                                                         rootFolderID: "0AIzEQ6JILNiUk9PVAxxxxxxxxxxxxx"),
+                                                         rootFolderID: "FAKEMyDriveFolderID0000000000000000"),
                        ProviderIdentity.rootIdentifier)
     }
 
@@ -78,7 +78,7 @@ final class ProviderIdentityTests: XCTestCase {
                                mimeType: "text/plain",
                                parents: ["firstparent0000000000000000000001"])
         XCTAssertEqual(ProviderIdentity.parentIdentifier(for: nested,
-                                                         rootFolderID: "0AIzEQ6JILNiUk9PVAxxxxxxxxxxxxx"),
+                                                         rootFolderID: "FAKEMyDriveFolderID0000000000000000"),
                        ProviderIdentity.identifier(forDriveID: "firstparent0000000000000000000001"),
                        "a folder's own children must stay inside that folder")
     }

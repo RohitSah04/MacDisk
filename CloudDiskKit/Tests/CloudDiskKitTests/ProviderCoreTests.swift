@@ -1240,7 +1240,7 @@ final class ProviderCoreTests: XCTestCase {
         // reports the account's My Drive id in `parents` rather than the alias. Anything parented to
         // an identifier the system never received is dropped from the replica, and Finder shows an
         // empty folder while the listing itself returned everything.
-        let myDriveID = "0AIzEQ6JILNiUk9PVAxxxxxxxxxxxxx"
+        let myDriveID = "FAKEMyDriveFolderID0000000000000000"
         let harness = harness([
             .json(DriveJSON.page(files: [
                 DriveJSON.file(id: Self.fileID, name: "top.txt", size: 1_024, version: "rev-1",
@@ -1266,7 +1266,7 @@ final class ProviderCoreTests: XCTestCase {
     }
 
     func testTheMyDriveIDIsRememberedForTheNextExtensionProcess() async throws {
-        let myDriveID = "0AIzEQ6JILNiUk9PVAxxxxxxxxxxxxx"
+        let myDriveID = "FAKEMyDriveFolderID0000000000000000"
         let topLevel = DriveJSON.file(id: Self.fileID, name: "top.txt", size: 1_024, version: "rev-1",
                                       parents: [myDriveID])
         let harness = harness([.json(DriveJSON.page(files: [topLevel]))])

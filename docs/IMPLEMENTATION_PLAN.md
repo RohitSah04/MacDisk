@@ -365,7 +365,7 @@ content with an error.
 captured and read:
 
 - Status rendered every row from live state — Finder location green at
-  `/Users/rohitsah/Library/CloudStorage/CloudDisk-CloudDisk`, "File Provider extension — Serving this
+  `~/Library/CloudStorage/CloudDisk-CloudDisk`, "File Provider extension — Serving this
   build — last answer 4 minutes ago", credential sharing green, quota and account both saying plainly
   that no Google account is connected, and the local-cache row reading "Finder is holding no CloudDisk
   file on this Mac — everything is online-only" with "Clear cached files" disabled.

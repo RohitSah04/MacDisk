@@ -9,7 +9,7 @@ is inferred from unit tests: those are reported separately in `docs/TESTING.md`.
 | --- | --- |
 | Run | 2026-10-31 21:40 → 2026-11-01 00:20 (IST), continuous |
 | Machine | macOS 26.2 (26B123), Apple Silicon, File Provider version 4838.41.1 |
-| Build under test | Release bundle at `/Users/rohitsah/Documents/pro/dist/CloudDisk.app`, `codesign --verify --deep --strict` clean |
+| Build under test | Release bundle at `~/Documents/pro/dist/CloudDisk.app`, `codesign --verify --deep --strict` clean |
 | Serving bundle | `fileproviderctl dump` → `bundle URL: ~/Documents/pro/dist/CloudDisk.app/Contents/PlugIns/CloudDiskProvider.appex`, `available system wide: 1`, exactly one LaunchServices claimant for `dev.rohitsah.clouddisk` |
 | Account | the signed-in Google account, reported by the app as 69.7 GB used of 5.5 TB |
 | Drive content | a real My Drive with 52 root objects, nested folders, PDFs, JPEGs and MP4s — no demo data was created beyond the probes named below |
@@ -296,10 +296,10 @@ with `removed` set or that Drive then answers with 404.
 **Found first: there was no sync at all.** Nothing polled Drive while the app was open — a change made
 elsewhere appeared only when Finder happened to re-enumerate. Added
 `AppCore.startLocationSyncWatch()` (a 120-second nudge for the root container and the working set,
-[pro/AppCore.swift:170](file:///Users/rohitsah/Documents/pro/pro/AppCore.swift#L170)), and made the
+[pro/AppCore.swift:170](pro/AppCore.swift#L170)), and made the
 app's own mutations nudge immediately
-([pro/FileBrowser.swift:235](file:///Users/rohitsah/Documents/pro/pro/FileBrowser.swift#L235),
-[pro/FileBrowser.swift:251](file:///Users/rohitsah/Documents/pro/pro/FileBrowser.swift#L251)). The
+([pro/FileBrowser.swift:235](pro/FileBrowser.swift#L235),
+[pro/FileBrowser.swift:251](pro/FileBrowser.swift#L251)). The
 nudge alone does not make a change visible: Drive's changes feed itself lags the mutation, from a few
 seconds to several minutes, and the first poll after a rename often returns zero changes (measured:
 `returned=0` at 23:57:14 for a rename made at 23:57:13). Propagation is therefore bounded by

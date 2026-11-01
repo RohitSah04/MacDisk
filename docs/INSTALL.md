@@ -12,8 +12,8 @@ CloudDisk is a native macOS app that mounts your Google Drive as a Finder locati
 
 ## Signing — read this before installing anywhere but this Mac
 
-The bundle is signed with an **Apple Development** certificate (team `59YP46BFR2`,
-`Apple Development: rohitsumit0231@gmail.com`). It is **not** signed with a Developer ID
+The bundle is signed with an **Apple Development** certificate (team `59YP46BFR2`).
+It is **not** signed with a Developer ID
 certificate and **not notarized**, because no Developer ID account exists on the build machine.
 `codesign --verify --deep --strict` passes; `spctl -a` **rejects** it. Consequences:
 
