@@ -286,11 +286,9 @@ enum DriveJSON {
         file(id: id, name: name, mimeType: DriveFile.folderMimeType, parents: parents)
     }
 
-    static func page(files: [[String: Any]], nextPageToken: String? = nil,
-                     newPageToken: String? = nil) -> [String: Any] {
+    static func page(files: [[String: Any]], nextPageToken: String? = nil) -> [String: Any] {
         var object: [String: Any] = ["kind": "drive#fileList", "files": files]
         if let nextPageToken { object["nextPageToken"] = nextPageToken }
-        if let newPageToken { object["newPageToken"] = newPageToken }
         return object
     }
 
@@ -303,12 +301,10 @@ enum DriveJSON {
     }
 
     static func changesPage(changes: [[String: Any]], nextPageToken: String? = nil,
-                            newStartPageToken: String? = nil,
-                            removes: Bool? = nil) -> [String: Any] {
+                            newStartPageToken: String? = nil) -> [String: Any] {
         var object: [String: Any] = ["kind": "drive#changeList", "changes": changes]
         if let nextPageToken { object["nextPageToken"] = nextPageToken }
         if let newStartPageToken { object["newStartPageToken"] = newStartPageToken }
-        if let removes { object["removes"] = removes }
         return object
     }
 

@@ -10,6 +10,7 @@ keep files offline — through the system's own File Provider replication engine
   - [OAUTH_SETUP.md](docs/OAUTH_SETUP.md) — the Google Cloud console side
   - [ARCHITECTURE.md](docs/ARCHITECTURE.md) — how it is built
   - [TESTING.md](docs/TESTING.md) — the automated suites and the human checklist
+  - [ACCEPTANCE_TEST_REPORT.md](docs/ACCEPTANCE_TEST_REPORT.md) — the checklist walked against a live Google account
   - [KNOWN_LIMITATIONS.md](docs/KNOWN_LIMITATIONS.md) — what is verified and what is not, per feature
   - [IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md) — the phase-by-phase build record
   - [RELEASE_CHECKLIST.md](docs/RELEASE_CHECKLIST.md) / [RELEASE_NOTES.md](docs/RELEASE_NOTES.md)
@@ -19,5 +20,6 @@ keep files offline — through the system's own File Provider replication engine
 - Release artifacts: `dist/CloudDisk.app`, `dist/CloudDisk.dmg` — development-signed, **not
   notarized**; read [RELEASE_NOTES.md](docs/RELEASE_NOTES.md) before handing them to anyone.
 
-Requires macOS 14+ on Apple silicon. No Google credential exists on the build machine, so every
-path that needs a signed-in account is marked unverified in the limitations doc rather than claimed.
+Requires macOS 14+ on Apple silicon. The app has been run end to end against a real Google account on
+this machine — [ACCEPTANCE_TEST_REPORT.md](docs/ACCEPTANCE_TEST_REPORT.md) records what was observed,
+what failed and what is still unverified rather than claimed.

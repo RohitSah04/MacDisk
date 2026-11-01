@@ -57,6 +57,34 @@ Drag the new `CloudDisk.app` over the old one and re-launch. The domain is re-re
 and the status screen verifies that the extension answering Finder lives inside the new build; if an
 old copy is still running, quit it first (`pgrep -lf CloudDisk.app`).
 
+### Checking which copy is actually serving the location
+
+The system binds a File Provider domain to a bundle *path*, and LaunchServices will hand that binding
+to whichever copy of the app registers itself last — including a build directory you never intended
+to use. This was observed three times during the acceptance run, once from a `Debug` copy under
+`DerivedData` and once from a second Release copy in a different folder. The symptom is not an error
+message: the location keeps working and silently serves the other build.
+
+```sh
+/usr/bin/fileproviderctl dump | grep -A6 dev.rohitsah.clouddisk.CloudDiskProvider
+```
+
+Read the `bundle URL` line. If it does not name the copy you installed, unregister the copy that
+claimed it and re-register yours:
+
+```sh
+/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister \
+  -u /path/to/competing/CloudDisk.app
+/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister \
+  -f -R -trusted /Applications/CloudDisk.app
+```
+
+Re-registering while the old location is still mounted can leave an inert folder behind under
+`~/Library/CloudStorage` named `CloudDisk-CloudDisk (31-10-26 10:17 PM)`. Those are not domains —
+`fileproviderctl dump` lists exactly one — but they hold materialized copies of your files and keep
+disk until you delete them. Only the live folder carries the `com.apple.file-provider-domain-id`
+extended attribute, which is what `ls -ld@ ~/Library/CloudStorage` shows.
+
 ## Uninstalling
 
 1. Launch CloudDisk and click **Sign out** — this revokes the Google grant and deletes the keychain

@@ -476,6 +476,10 @@
 				LD_RUNPATH_SEARCH_PATHS = "@executable_path/../Frameworks";
 				MACOSX_DEPLOYMENT_TARGET = 27.0;
 				MARKETING_VERSION = 1.0;
+				OTHER_LDFLAGS = (
+					"-framework",
+					AVKit,
+				);
 				PRODUCT_BUNDLE_IDENTIFIER = dev.rohitsah.clouddisk;
 				PRODUCT_NAME = CloudDisk;
 				REGISTER_APP_GROUPS = YES;
@@ -516,6 +520,10 @@
 				LD_RUNPATH_SEARCH_PATHS = "@executable_path/../Frameworks";
 				MACOSX_DEPLOYMENT_TARGET = 27.0;
 				MARKETING_VERSION = 1.0;
+				OTHER_LDFLAGS = (
+					"-framework",
+					AVKit,
+				);
 				PRODUCT_BUNDLE_IDENTIFIER = dev.rohitsah.clouddisk;
 				PRODUCT_NAME = CloudDisk;
 				REGISTER_APP_GROUPS = YES;

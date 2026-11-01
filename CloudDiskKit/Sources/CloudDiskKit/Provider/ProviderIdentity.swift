@@ -50,7 +50,13 @@ public enum ProviderIdentity {
     }
 
     /// The single parent File Provider will replicate this item under.
-    static func parentIdentifier(for file: DriveFile) -> NSFileProviderItemIdentifier {
+    ///
+    /// `rootFolderID` is the account's real "My Drive" folder id. Drive puts it in `parents` for every
+    /// top-level object while the provider addresses that folder with the reserved root container
+    /// identifier, so the two have to be reconciled here: an item parented to an id the system was
+    /// never given is not filed under anything, and Finder shows an empty folder.
+    static func parentIdentifier(for file: DriveFile,
+                                 rootFolderID: String? = nil) -> NSFileProviderItemIdentifier {
         if file.isTrashed {
             // Drive keeps reporting the folder a trashed object came from. A children query excludes
             // trashed items, so that parent would hold a row the system can never list — and the
@@ -63,6 +69,7 @@ public enum ProviderIdentity {
             // it keeps the item visible instead of dropping it out of the replica entirely.
             return rootIdentifier
         }
+        if parent == driveRootID || parent == rootFolderID { return rootIdentifier }
         return identifier(forDriveID: parent)
     }
 
@@ -74,12 +81,20 @@ public enum ProviderIdentity {
     /// look identical and leave the system serving stale bytes.
     static let maximumVersionComponentByteCount = 128
 
-    /// Metadata for an item changes with its name, parent, star and trash state, and a Drive name can
-    /// reach 1024 characters, so the metadata component is hashed even when it would fit.
-    static func itemVersion(for file: DriveFile) -> NSFileProviderItemVersion {
-        NSFileProviderItemVersion(
+    /// Metadata for an item changes with its name, parent, star, trash state and keep-offline mark, and
+    /// a Drive name can reach 1024 characters, so the metadata component is hashed even when it would fit.
+    ///
+    /// The pin belongs in the version because File Provider reads an item's `contentPolicy` once and
+    /// keeps the answer — a released pin whose version is unchanged leaves the replica marked
+    /// "prevent eviction" forever, and `evictItem` then answers `.nonEvictable` for a file the user has
+    /// explicitly asked to let go. Restating the mark as a metadata change is what makes the system ask
+    /// for the item again and take the new policy. Content bytes are untouched: `contentVersion` does
+    /// not vary with the pin, so a pin toggle never costs a re-download.
+    static func itemVersion(for file: DriveFile, pinned: Bool = false) -> NSFileProviderItemVersion {
+        let metadataToken = file.metadataVersionToken + "|keep:\(pinned ? 1 : 0)"
+        return NSFileProviderItemVersion(
             contentVersion: bounded(file.id, Data(file.contentVersionToken.utf8)),
-            metadataVersion: bounded(file.id, Data(SHA256.hash(data: Data(file.metadataVersionToken.utf8))))
+            metadataVersion: bounded(file.id, Data(SHA256.hash(data: Data(metadataToken.utf8))))
         )
     }
 

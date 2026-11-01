@@ -266,7 +266,7 @@ Three seams, each one there because some part of the system cannot be reached fr
   activity log really are cross-process state rather than process memory.
 
 - Pure logic (Drive service, token provider, query escaping, page/anchor encoding, item mapping, error
-  taxonomy, write permissions, cache arithmetic) → `CloudDiskKitTests`, 316 cases, run with
+  taxonomy, write permissions, cache arithmetic) → `CloudDiskKitTests`, 344 cases, run with
   `swift test --package-path CloudDiskKit`.
 - A registered domain, when one exists → the app's hosted bundle `CloudDiskTests`
   (`xcodebuild -scheme CloudDisk -destination platform=macOS test`). `NSFileProviderManager.domains()`

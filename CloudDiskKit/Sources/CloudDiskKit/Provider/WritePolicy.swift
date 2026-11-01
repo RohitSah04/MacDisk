@@ -31,8 +31,7 @@ enum WritePolicy {
             case .itemReadOnly(let name):
                 return "Google Drive only lets you read “\(name)”, not edit it."
             case .itemLockedInFolder(let name):
-                return "“\(name)” belongs to someone else's folder, and Google Drive will not let "
-                    + "it leave it."
+                return "Google Drive does not let “\(name)” move, so it has to stay where it is."
             case .containerInTrash(let name):
                 return "“\(name)” is in the Google Drive trash, so nothing can be filed into it."
             case .containerReadOnly(let name):
@@ -62,7 +61,8 @@ enum WritePolicy {
         // every write in this set — which is why it is checked before the move-specific flag.
         if permissions?.canEdit == false { return .itemReadOnly(name: file.name) }
         if fields.contains(.parentItemIdentifier),
-           permissions?.canMoveItemOutOfWorld == false {
+           permissions?.canMoveItemWithinDrive == false,
+           permissions?.canMoveItemOutOfDrive == false {
             return .itemLockedInFolder(name: file.name)
         }
         return nil

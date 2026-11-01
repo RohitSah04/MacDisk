@@ -59,6 +59,30 @@ final class ProviderIdentityTests: XCTestCase {
                        ProviderIdentity.identifier(forDriveID: "firstparent0000000000000000000001"))
     }
 
+    func testAChildOfTheRealMyDriveFolderIsFiledUnderTheRootContainer() {
+        // Drive never puts the "root" alias in `parents`: a root listing names the account's My Drive
+        // folder by its real id. An item parented to an identifier the system was never given belongs
+        // to no container, and Finder shows an empty folder while the API returns every file.
+        let topLevel = DriveFile(id: "1234567890abcdefghijklmnopqrstuv", name: "top.txt",
+                                 mimeType: "text/plain", parents: ["0AIzEQ6JILNiUk9PVAxxxxxxxxxxxxx"])
+        XCTAssertEqual(ProviderIdentity.parentIdentifier(for: topLevel),
+                       ProviderIdentity.identifier(forDriveID: "0AIzEQ6JILNiUk9PVAxxxxxxxxxxxxx"),
+                       "without the alias the item is filed under a container nobody asked for")
+        XCTAssertEqual(ProviderIdentity.parentIdentifier(for: topLevel,
+                                                         rootFolderID: "0AIzEQ6JILNiUk9PVAxxxxxxxxxxxxx"),
+                       ProviderIdentity.rootIdentifier)
+    }
+
+    func testTheAliasOnlyAppliesToMyDriveNotToEveryFolderAtTheTop() {
+        let nested = DriveFile(id: "1234567890abcdefghijklmnopqrstuv", name: "inside.txt",
+                               mimeType: "text/plain",
+                               parents: ["firstparent0000000000000000000001"])
+        XCTAssertEqual(ProviderIdentity.parentIdentifier(for: nested,
+                                                         rootFolderID: "0AIzEQ6JILNiUk9PVAxxxxxxxxxxxxx"),
+                       ProviderIdentity.identifier(forDriveID: "firstparent0000000000000000000001"),
+                       "a folder's own children must stay inside that folder")
+    }
+
     func testATrashedItemBelongsToTheTrashContainerNotTheFolderItCameFrom() {
         // Drive keeps reporting the original parent after trashing. Listing it there would put a row
         // inside a folder whose children query filters trashed items out of existence.
@@ -113,6 +137,30 @@ final class ProviderIdentityTests: XCTestCase {
                        ProviderIdentity.itemVersion(for: starred).contentVersion)
         XCTAssertNotEqual(ProviderIdentity.itemVersion(for: base).metadataVersion,
                           ProviderIdentity.itemVersion(for: starred).metadataVersion)
+    }
+
+    /// The bug this closes: a released pin whose version is unchanged is never re-read by File Provider,
+    /// so the replica keeps the "prevent eviction" mark and `evictItem` answers `.nonEvictable` for a
+    /// file the user has just asked to let go.
+    func testKeepingAndReleasingAnItemMovesOnlyItsMetadataVersion() {
+        let file = DriveFile(id: "1234567890abcdefghijklmnopqrstuv", name: "a.txt",
+                             mimeType: "text/plain", version: "rev-1")
+        let kept = ProviderIdentity.itemVersion(for: file, pinned: true)
+        let lazy = ProviderIdentity.itemVersion(for: file, pinned: false)
+
+        XCTAssertNotEqual(kept.metadataVersion, lazy.metadataVersion)
+        // No content re-download may cost the user their copy: bytes are the same object either way.
+        XCTAssertEqual(kept.contentVersion, lazy.contentVersion)
+        // And the mark is not a per-toggle nonce — the same state always publishes the same version.
+        XCTAssertEqual(ProviderIdentity.itemVersion(for: file, pinned: true).metadataVersion,
+                       kept.metadataVersion)
+    }
+
+    func testAnUnpinnedItemPublishesTheSameVersionAsTheOneArgumentForm() {
+        let file = DriveFile(id: "1234567890abcdefghijklmnopqrstuv", name: "a.txt",
+                             mimeType: "text/plain", version: "rev-1")
+        XCTAssertEqual(ProviderIdentity.itemVersion(for: file).metadataVersion,
+                       ProviderIdentity.itemVersion(for: file, pinned: false).metadataVersion)
     }
 
     func testVersionTokensFallBackInTheDocumentedOrder() {
@@ -229,6 +277,76 @@ final class DriveFileProviderItemTests: XCTestCase {
         XCTAssertFalse(item.capabilities.contains(.allowsWriting))
         XCTAssertFalse(item.capabilities.contains(.allowsAddingSubItems))
         XCTAssertFalse(item.capabilities.contains(.allowsTrashing))
+    }
+
+    func testAFolderAdvertisesTheBitsThatMakeItListable() {
+        // Without `userReadable` the system files the directory as mode `--x`, `readdir` answers
+        // EACCES and Finder shows a folder that never fills, no matter how many children the
+        // provider published. `userExecutable` is what makes a path traversable at all.
+        let folder = DriveFile(id: "fold00000000000000000000000000001", name: "Family",
+                               mimeType: DriveFile.folderMimeType,
+                               capabilities: DriveCapabilities(canEdit: true, canDownload: true,
+                                                               canTrash: true, canAddChildren: true))
+        let item = DriveFileProviderItem.make(from: folder)
+        XCTAssertEqual(item.fileSystemFlags, [.userReadable, .userWritable, .userExecutable])
+    }
+
+    func testAFolderReadOnlyInDriveIsStillListable() {
+        let readOnly = DriveFile(id: "fold00000000000000000000000000001", name: "Shared",
+                                 mimeType: DriveFile.folderMimeType,
+                                 capabilities: DriveCapabilities(canAddChildren: false))
+        let item = DriveFileProviderItem.make(from: readOnly)
+        XCTAssertTrue(item.fileSystemFlags.contains(.userReadable),
+                      "a shared folder the user cannot write to must still be openable")
+        XCTAssertTrue(item.fileSystemFlags.contains(.userExecutable))
+    }
+
+    func testAFileAdvertisesNoExecuteBit() {
+        // An executable data file would be offered as an application to run.
+        XCTAssertEqual(DriveFileProviderItem.make(from: file()).fileSystemFlags,
+                       [.userReadable, .userWritable])
+    }
+
+    func testADateOlderThanTheSystemCanStoreIsReplacedByTheCreationTime() throws {
+        // Drive answers 1601-01-01 — a zero Windows FILETIME — for files imported from other
+        // systems. File Provider keeps dates as int64 nanoseconds and clamps anything below 1677, so
+        // publishing that date would leave the file stamped 1677 in Finder and the on-disk object
+        // disagreeing with the item reported for it, which FPCK then reports forever.
+        let imported = DriveFile(id: "1234567890abcdefghijklmnopqrstuv", name: "certificate.pdf",
+                                 mimeType: "application/pdf",
+                                 modifiedTime: "1601-01-01T00:00:00Z",
+                                 createdTime: "2025-02-14T08:47:23.808Z")
+        let item = DriveFileProviderItem.make(from: imported)
+        XCTAssertEqual(item.contentModificationDate, DriveDate.parse("2025-02-14T08:47:23.808Z"))
+        XCTAssertEqual(item.creationDate, DriveDate.parse("2025-02-14T08:47:23.808Z"))
+    }
+
+    func testAUsableModifiedTimeIsPublishedExactlyAsDriveReportsIt() {
+        let file = DriveFile(id: "1234567890abcdefghijklmnopqrstuv", name: "notes.txt",
+                             mimeType: "text/plain",
+                             modifiedTime: "2026-10-29T23:12:04.500Z",
+                             createdTime: "2026-01-01T00:00:00Z")
+        let item = DriveFileProviderItem.make(from: file)
+        XCTAssertEqual(item.contentModificationDate, DriveDate.parse("2026-10-29T23:12:04.500Z"))
+        XCTAssertEqual(item.creationDate, DriveDate.parse("2026-01-01T00:00:00Z"))
+    }
+
+    func testADateTheSystemCannotStoreIsNeverPublishedAsEitherDate() {
+        let unusable = DriveFile(id: "1234567890abcdefghijklmnopqrstuv", name: "ancient.pdf",
+                                 mimeType: "application/pdf",
+                                 modifiedTime: "1601-01-01T00:00:00Z",
+                                 createdTime: "1601-01-01T00:00:00Z")
+        XCTAssertNil(unusable.fileProviderModificationDate)
+        XCTAssertNil(unusable.fileProviderCreationDate)
+        XCTAssertNotNil(unusable.parsedModifiedTime, "the timestamp is readable, just not storeable")
+    }
+
+    func testTheFileProviderDateFloorIsTheBoundaryItself() {
+        XCTAssertEqual(DriveDate.representableForFileProvider(DriveDate.fileProviderDateFloor),
+                       DriveDate.fileProviderDateFloor)
+        XCTAssertNil(DriveDate.representableForFileProvider(
+            DriveDate.fileProviderDateFloor.addingTimeInterval(-1)))
+        XCTAssertNil(DriveDate.representableForFileProvider(nil))
     }
 
     func testAGoogleDocumentIsReadOnlyAndTypedAsItsExportFormat() {

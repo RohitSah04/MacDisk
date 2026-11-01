@@ -9,6 +9,7 @@ import SwiftUI
 /// extension writes. Nothing is simulated, so a green row means that part actually works.
 struct StatusView: View {
     @ObservedObject var core: AppCore
+    @State private var confirmingRebuild = false
 
     var body: some View {
         ScrollView {
@@ -35,6 +36,18 @@ struct StatusView: View {
             .frame(maxWidth: .infinity, alignment: .center)
         }
         .frame(minWidth: 720, minHeight: 460)
+        .confirmationDialog("Rebuild the Finder location?",
+                            isPresented: $confirmingRebuild,
+                            titleVisibility: .visible) {
+            Button("Rebuild", role: .destructive) {
+                Task { await core.rebuildLocation() }
+            }
+            Button("Cancel", role: .cancel) { }
+        } message: {
+            Text("CloudDisk removes its Finder location and creates it again, so File Provider "
+               + "re-materializes every folder and file. Files already downloaded to this Mac are "
+               + "kept; Finder closes the folder for a moment.")
+        }
         .refreshable {
             await core.refreshStorage()
             await core.refreshLocalCache()
@@ -121,6 +134,9 @@ struct StatusView: View {
                     ?? "Registered. Finder has not mounted the volume yet — it usually appears within a few seconds.") {
                 if url != nil {
                     Button("Open in Finder") { core.revealLocation() }
+                    Button("Rebuild") { confirmingRebuild = true }
+                        .help("Re-create the Finder location so File Provider re-materializes every "
+                            + "folder and file. Downloaded copies are kept.")
                 } else {
                     Button("Check again") {
                         Task { await core.refreshLocation() }

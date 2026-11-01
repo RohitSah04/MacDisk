@@ -68,5 +68,7 @@ export CLOUDDISK_LIVE_CLIENT_ID=<your client id>
 export CLOUDDISK_LIVE_REFRESH_TOKEN=<a refresh token for a test user>
 ```
 
-The 14 live cases report **skipped**, not passed, without them — no credentials exist on the build
-machine, so none of them has ever been run here.
+The 14 live cases report **skipped**, not passed, without them. This machine has a signed-in account
+now, so they could be run; they were not, because the behaviour they cover was measured by hand against
+the live account instead — see `docs/ACCEPTANCE_TEST_REPORT.md`. Passing them in the environment is the
+way to make that coverage repeat automatically.

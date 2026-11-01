@@ -21,9 +21,15 @@ public actor ProviderState {
     private let directory: URL
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
+    /// How close together two access notes for the same object have to be to collapse into one write.
+    private let accessCoalesceInterval: TimeInterval
+    /// The last access time actually written per Drive id, so a burst of extent reads for one streaming
+    /// file costs one file write instead of one per range.
+    private var lastAccessWrite: [String: Date] = [:]
 
-    public init(directory: URL) {
+    public init(directory: URL, accessCoalesceInterval: TimeInterval = 30) {
         self.directory = directory
+        self.accessCoalesceInterval = accessCoalesceInterval
     }
 
     /// Creates the App Group container directory for a domain.
@@ -44,17 +50,24 @@ public actor ProviderState {
 
     /// Reads a JSON file, treating unreadable or corrupt content as absent instead of an error: a
     /// damaged cursor only costs a rescan, it must not wedge the extension.
-    private func read<T: Decodable>(_ type: T.Type, name: String) -> T? {
-        guard let data = try? Data(contentsOf: url(for: name)) else { return nil }
+    private func read<T: Decodable>(_ type: T.Type, at url: URL) -> T? {
+        guard let data = try? Data(contentsOf: url) else { return nil }
         return try? decoder.decode(type, from: data)
     }
 
-    private func write<T: Encodable>(_ value: T, name: String) throws {
+    private func read<T: Decodable>(_ type: T.Type, name: String) -> T? {
+        read(type, at: url(for: name))
+    }
+
+    private func write<T: Encodable>(_ value: T, to url: URL) throws {
         let data = try encoder.encode(value)
-        let target = url(for: name)
-        let temporary = target.appendingPathExtension("writing")
+        let temporary = url.appendingPathExtension("writing")
         try data.write(to: temporary, options: [.atomic])
-        _ = try FileManager.default.replaceItemAt(target, withItemAt: temporary)
+        _ = try FileManager.default.replaceItemAt(url, withItemAt: temporary)
+    }
+
+    private func write<T: Encodable>(_ value: T, name: String) throws {
+        try write(value, to: url(for: name))
     }
 
     // MARK: Sync cursor
@@ -74,6 +87,27 @@ public actor ProviderState {
     /// extension has learned that its cursor is no longer usable.
     public func clearSyncCursor() throws {
         try? FileManager.default.removeItem(at: url(for: "changes-cursor.json"))
+    }
+
+    // MARK: My Drive identity
+
+    /// Drive's real id for the account's "My Drive" folder, as last observed.
+    ///
+    /// `files.list(q: "'root' in parents")` answers children whose `parents` names that id rather
+    /// than the `root` alias, so without this the provider parents every top-level item to a
+    /// container identifier File Provider has never heard of and the replica loses them. It is
+    /// remembered across launches because a restart must not put the folder's contents back to zero.
+    struct RootFolder: Codable, Equatable {
+        var folderID: String
+        var observedAt: Date
+    }
+
+    public func driveRootFolderID() -> String? {
+        read(RootFolder.self, name: "drive-root.json")?.folderID
+    }
+
+    public func setDriveRootFolderID(_ folderID: String) throws {
+        try write(RootFolder(folderID: folderID, observedAt: Date()), name: "drive-root.json")
     }
 
     // MARK: Extension liveness
@@ -129,6 +163,122 @@ public actor ProviderState {
         if pinned { current.insert(driveID) } else { current.remove(driveID) }
         try write(Pins(driveIDs: current.sorted()), name: "pinned-items.json")
         return current
+    }
+
+    // MARK: Access ledger
+
+    /// The last time a copy of one object reached this Mac, per Drive id.
+    ///
+    /// This is what makes auto-eviction a decision instead of a guess: the inventory says what is on
+    /// disk, only a record of use says whether anything still wants it. One small file per id, which is
+    /// the activity log's arrangement and for the same reason — the app and the extension both write
+    /// here, and one shared JSON would need a read-modify-write in which either process can lose the
+    /// other's records. Per-item files make the last writer correct by construction.
+    struct AccessRecord: Codable, Equatable {
+        var accessedAt: Date
+    }
+
+    private var accessDirectory: URL {
+        directory.appendingPathComponent("access", isDirectory: true)
+    }
+
+    /// A ledger file name for a Drive id, or nil when the id is not a plain token.
+    ///
+    /// The id comes from Drive, but it becomes a path component here, so it is checked rather than
+    /// trusted: an id able to name a parent directory would let one record escape the shared container.
+    static func ledgerFileName(forDriveID driveID: String) -> String? {
+        let allowed = CharacterSet(charactersIn:
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_")
+        guard !driveID.isEmpty, driveID.count <= 64,
+              driveID.unicodeScalars.allSatisfy({ allowed.contains($0) }) else { return nil }
+        return "\(driveID).json"
+    }
+
+    private func ledgerURL(forDriveID driveID: String) -> URL? {
+        guard let name = Self.ledgerFileName(forDriveID: driveID) else { return nil }
+        return accessDirectory.appendingPathComponent(name)
+    }
+
+    /// Records that an object's bytes arrived. Best effort by design: a ledger write that fails only
+    /// costs this item one eviction pass, because an unknown last access is treated as still in use.
+    public func noteAccess(_ driveID: String, at date: Date = Date()) {
+        guard let url = ledgerURL(forDriveID: driveID) else { return }
+        if let written = lastAccessWrite[driveID],
+           date.timeIntervalSince(written) < accessCoalesceInterval { return }
+        do {
+            try FileManager.default.createDirectory(at: accessDirectory, withIntermediateDirectories: true)
+            try write(AccessRecord(accessedAt: date), to: url)
+            lastAccessWrite[driveID] = date
+        } catch {
+            // Nothing to report upward: the fetch that just succeeded is the user's news, not this.
+        }
+    }
+
+    public func accessTime(forDriveID driveID: String) -> Date? {
+        guard let url = ledgerURL(forDriveID: driveID) else { return nil }
+        return read(AccessRecord.self, at: url)?.accessedAt
+    }
+
+    /// Every recorded access, skipping ids that are not valid ledger keys — a damaged or unforeseen
+    /// name must not abort a sweep, it simply leaves that item protected as unknown.
+    public func accessTimes() -> [String: Date] {
+        let files = (try? FileManager.default.contentsOfDirectory(
+            at: accessDirectory, includingPropertiesForKeys: nil)) ?? []
+        var collected: [String: Date] = [:]
+        for url in files where url.pathExtension == "json" {
+            let driveID = url.deletingPathExtension().lastPathComponent
+            guard Self.ledgerFileName(forDriveID: driveID) != nil,
+                  let record = read(AccessRecord.self, at: url) else { continue }
+            collected[driveID] = record.accessedAt
+        }
+        return collected
+    }
+
+    /// Drops one item's history once its copy is gone, so a later copy that arrives by some route this
+    /// extension does not see — Finder's own "Keep downloaded", a reimport after a restore — is not
+    /// judged idle by a timestamp from the previous one.
+    public func forgetAccess(_ driveID: String) {
+        guard let url = ledgerURL(forDriveID: driveID) else { return }
+        try? FileManager.default.removeItem(at: url)
+        lastAccessWrite[driveID] = nil
+    }
+
+    /// Forgets recorded ids that no longer have a copy on disk and have not been seen for a while, so
+    /// the ledger cannot grow without bound as the account changes.
+    ///
+    /// Measured from each record's own date rather than the file's modification time, because a note
+    /// written minutes ago about an access long past is exactly what this is looking to drop — and the
+    /// clock of the machine that wrote it is not the fact being kept.
+    public func pruneAccess(knownDriveIDs: Set<String>, olderThan cutoff: Date) {
+        let files = (try? FileManager.default.contentsOfDirectory(
+            at: accessDirectory, includingPropertiesForKeys: nil)) ?? []
+        for url in files where url.pathExtension == "json" {
+            let driveID = url.deletingPathExtension().lastPathComponent
+            guard !knownDriveIDs.contains(driveID) else { continue }
+            guard let record = read(AccessRecord.self, at: url),
+                  record.accessedAt < cutoff else { continue }
+            try? FileManager.default.removeItem(at: url)
+            lastAccessWrite[driveID] = nil
+        }
+    }
+
+    // MARK: Auto-eviction bookkeeping
+
+    /// The last sweep, written by whichever process ran it.
+    ///
+    /// Kept on disk rather than in memory because the app and the extension each hold their own
+    /// sweeper: without a shared stamp both would enumerate the materialized set every few minutes and
+    /// double the work for the same bytes.
+    struct EvictionRun: Codable, Equatable {
+        var at: Date
+    }
+
+    public func lastAutoEvictionAt() -> Date? {
+        read(EvictionRun.self, name: "auto-eviction.json")?.at
+    }
+
+    public func recordAutoEviction(at date: Date = Date()) {
+        try? write(EvictionRun(at: date), name: "auto-eviction.json")
     }
 
     // MARK: Activity log

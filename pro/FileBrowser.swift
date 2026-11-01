@@ -230,6 +230,9 @@ final class FileBrowser: ObservableObject {
             guard let index = items.firstIndex(where: { $0.id == file.id }) else { return }
             items[index] = updated
             if let folderAt = trail.firstIndex(where: { $0.id == file.id }) { trail[folderAt] = updated }
+            // This rename went to Drive directly, so File Provider never heard about it and would keep
+            // serving the old name from the folder it imported.
+            await core.syncFinderLocation()
             action = .done("Renamed to “\(trimmed)”.")
         } catch {
             action = .refused("The rename failed: \(error.localizedDescription)")
@@ -245,6 +248,7 @@ final class FileBrowser: ObservableObject {
         do {
             _ = try await drive.setTrashed(true, fileID: file.id)
             items.removeAll { $0.id == file.id }
+            await core.syncFinderLocation()
             action = .done("“\(file.name)” is in Drive's trash — empty it there to delete for good.")
         } catch {
             action = .refused("The delete failed: \(error.localizedDescription)")

@@ -15,7 +15,7 @@ final class DriveServiceTests: XCTestCase {
         let transport = StubTransport(script: [
             .json(DriveJSON.page(files: [DriveJSON.file(id: "a1aaaaa", name: "one.txt"),
                                         DriveJSON.file(id: "b2bbbbb", name: "two.txt")],
-                                nextPageToken: "page-2", newPageToken: "same-query-token")),
+                                nextPageToken: "page-2")),
             .json(DriveJSON.page(files: [DriveJSON.file(id: "c3ccccc", name: "three.txt")],
                                 nextPageToken: "page-3")),
             .json(DriveJSON.page(files: [DriveJSON.file(id: "d4ddddd", name: "four.txt"),
@@ -64,7 +64,6 @@ final class DriveServiceTests: XCTestCase {
         XCTAssertEqual(query["includeItemsFromAllDrives"], "true",
                        "without this, shared-drive folders enumerate as empty")
         XCTAssertTrue(query["fields"]?.contains("nextPageToken") == true)
-        XCTAssertTrue(query["fields"]?.contains("newPageToken") == true)
         XCTAssertEqual(page.fileList.count, 0)
     }
 
@@ -230,12 +229,14 @@ final class DriveServiceTests: XCTestCase {
         XCTAssertEqual(batch.startPageToken, "9", "the anchor is the terminal token, not the first")
         XCTAssertNil(batch.resumeToken)
         XCTAssertFalse(batch.truncated)
-        XCTAssertFalse(batch.removedEverything)
         XCTAssertEqual(transport.requestCount, 3)
         XCTAssertEqual(transport.queryItems(at: 1)["pageToken"], "change-2")
     }
 
-    func testChangePageAsksForTrashesAndSharedDrives() async throws {
+    /// The parameter names have to be the v3 ones. `includeCorpusTrashes` and
+    /// `includeRemovedEntries` are v2, and a `fields` selection v3 does not recognise makes the
+    /// whole call fail, which leaves Finder with an empty CloudDisk.
+    func testChangePageUsesTheParametersV3Accepts() async throws {
         let transport = StubTransport(script: [.json(DriveJSON.changesPage(changes: [],
                                                                           newStartPageToken: "12"))])
         let env = DriveTestEnvironment.make(transport: transport)
@@ -243,10 +244,31 @@ final class DriveServiceTests: XCTestCase {
         _ = try await env.service.changePage(from: "11")
         let query = transport.queryItems(at: 0)
         XCTAssertEqual(query["pageToken"], "11")
-        XCTAssertEqual(query["includeCorpusTrashes"], "true")
-        XCTAssertEqual(query["includeRemovedEntries"], "true")
+        XCTAssertEqual(query["includeCorpusRemovals"], "true")
+        XCTAssertEqual(query["includeRemoved"], "true")
         XCTAssertEqual(query["supportsAllDrives"], "true")
+        XCTAssertNil(query["includeCorpusTrashes"])
+        XCTAssertNil(query["includeRemovedEntries"])
         XCTAssertTrue(query["fields"]?.contains("newStartPageToken") == true)
+    }
+
+    /// `400 Invalid field selection removes` was the first real sign-in's answer to the changes
+    /// feed. `removes` is not a ChangeListResponse field, so asking for it fails the request.
+    func testChangePageFieldSelectionNamesOnlyV3ChangeListFields() async throws {
+        let transport = StubTransport(script: [.json(DriveJSON.changesPage(changes: [],
+                                                                          newStartPageToken: "12"))])
+        let env = DriveTestEnvironment.make(transport: transport)
+
+        _ = try await env.service.changePage(from: "11")
+        guard let fields = transport.queryItems(at: 0)["fields"] else {
+            XCTFail("the changes request carried no field selection")
+            return
+        }
+        XCTAssertFalse(fields.contains("removes"),
+                       "changes.list has no removes field, so Google rejects the whole request: \(fields)")
+        XCTAssertTrue(fields.contains("changes("), "the change list itself must be selected")
+        XCTAssertTrue(fields.contains("removed"),
+                      "item-level removals are how v3 reports a gone object, so they must be selected")
     }
 
     func testCollectChangesTruncatesAndHandBackAResumableToken() async throws {
@@ -265,38 +287,24 @@ final class DriveServiceTests: XCTestCase {
         XCTAssertEqual(batch.changes.count, 1)
     }
 
-    func testCollectChangesReportsAGlobalPurge() async throws {
+    /// Dropped history is not a page flag in v3 — Google stops honouring the token. The drain has to
+    /// let that error through untouched so the enumerator can answer `.syncAnchorExpired` and let
+    /// the system re-scan.
+    func testCollectChangesPropagatesAnExpiredTokenFromMidDrain() async throws {
         let transport = StubTransport(script: [
-            .json(DriveJSON.changesPage(changes: [], nextPageToken: "change-2",
-                                       newStartPageToken: "20", removes: true)),
-            .json(DriveJSON.changesPage(changes: [], newStartPageToken: "21"))
+            .json(DriveJSON.changesPage(changes: [], nextPageToken: "change-2")),
+            .googleError(status: 410, reason: "expiredStartPageToken",
+                         message: "Start time window too large")
         ])
         let env = DriveTestEnvironment.make(transport: transport)
 
-        let batch = try await env.service.collectChanges(from: "19")
-        XCTAssertTrue(batch.removedEverything,
-                      "Google marks the purge on the page where history was dropped; a feed that "
-                      + "later pages cleanly still has to expire the caller's anchor")
-
-        let purged = StubTransport(script: [
-            .json(DriveJSON.changesPage(changes: [], nextPageToken: "only", newStartPageToken: "20",
-                                       removes: true)),
-            .json(DriveJSON.changesPage(changes: [], newStartPageToken: "21", removes: true))
-        ])
-        let second = DriveTestEnvironment.make(transport: purged)
-        let batch2 = try await second.service.collectChanges(from: "19", maxPages: 1)
-        XCTAssertTrue(batch2.removedEverything)
-
-        // The other direction: a feed that never mentions `removes` must leave the anchor alone.
-        let clean = DriveTestEnvironment.make(transport: StubTransport(script: [
-            .json(DriveJSON.changesPage(changes: [DriveJSON.change(fileId: "a1aaaaa",
-                                                                  file: DriveJSON.file(id: "a1aaaaa",
-                                                                                      name: "x"))],
-                                       newStartPageToken: "22"))
-        ]))
-        let batch3 = try await clean.service.collectChanges(from: "21")
-        XCTAssertFalse(batch3.removedEverything)
-        XCTAssertEqual(batch3.startPageToken, "22")
+        do {
+            _ = try await env.service.collectChanges(from: "19")
+            XCTFail("expected the expired token to end the drain")
+        } catch let error as DriveError {
+            XCTAssertEqual(error, .syncCursorExpired)
+        }
+        XCTAssertEqual(transport.requestCount, 2)
     }
 
     func testCollectChangesFailsLoudlyWithoutAStartToken() async throws {
@@ -553,6 +561,37 @@ final class DriveServiceTests: XCTestCase {
         }
         XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path),
                        "a failed download must not leave a zero-byte file behind")
+    }
+
+    // MARK: Placing the bytes URLSession wrote
+
+    func testDownloadedBytesArePlacedEvenWhenTheDestinationWasNeverCreated() throws {
+        // The real transport downloads to a file URLSession owns and moves it into place. Clearing the
+        // destination first is only correct if something is there: removing a path that was never
+        // created throws, and that throw arrived as a failed download for bytes that were intact.
+        let directory = DriveTestEnvironment.scratchDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let source = directory.appendingPathComponent("urlsession-tmp")
+        let destination = directory.appendingPathComponent("photo.jpg")
+        try Data("payload".utf8).write(to: source)
+
+        try DownloadedFile.place(from: source, to: destination)
+
+        XCTAssertEqual(try Data(contentsOf: destination), Data("payload".utf8))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: source.path))
+    }
+
+    func testDownloadedBytesReplaceWhatAnEarlierAttemptLeftBehind() throws {
+        let directory = DriveTestEnvironment.scratchDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let source = directory.appendingPathComponent("urlsession-tmp")
+        let destination = directory.appendingPathComponent("photo.jpg")
+        try Data("half a file".utf8).write(to: destination)
+        try Data("payload".utf8).write(to: source)
+
+        try DownloadedFile.place(from: source, to: destination)
+
+        XCTAssertEqual(try Data(contentsOf: destination), Data("payload".utf8))
     }
 
     // MARK: Byte ranges

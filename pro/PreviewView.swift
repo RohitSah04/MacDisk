@@ -1,19 +1,76 @@
 import AppKit
+import CloudDiskKit
+import Combine
 import Quartz
 import SwiftUI
 
 /// Quick Look inside the app, pointed at the File Provider path for one object.
 ///
-/// The URL handed to the preview view is the replica's own path, so a dataless file is materialized by
-/// the system as part of the preview — the same route Finder's space-bar takes. Whether a given preview
-/// gets partial or full materialization is the system's decision, not CloudDisk's, and that is recorded
-/// as a limitation rather than claimed as a feature.
+/// The URL is the replica's own path, so the preview reads from the same place Finder's space-bar does.
+/// The bytes are fetched before that path is handed over, because Quick Look's helper asks the
+/// thumbnailing daemon for a copy of the file rather than reading the replica itself, and the daemon
+/// gives up on a dataless item instead of waiting for File Provider to download it — which leaves a
+/// document icon where the file should be. Finder waits; CloudDisk waits too.
 struct PreviewView: View {
+    let file: DriveFile
     let url: URL
 
+    @StateObject private var fetch: PreviewFetch
+
+    init(file: DriveFile, url: URL, offline: OfflineStore) {
+        self.file = file
+        self.url = url
+        _fetch = StateObject(wrappedValue: PreviewFetch(file: file, offline: offline))
+    }
+
     var body: some View {
-        QuickLookView(url: url)
-            .frame(minWidth: 520, minHeight: 420)
+        Group {
+            switch fetch.stage {
+            case .fetching:
+                ProgressView("Getting “\(file.name)” ready to preview…")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            case .ready:
+                QuickLookView(url: url)
+            case .refused(let problem):
+                ContentUnavailableView {
+                    Label("Nothing to preview yet", systemImage: "exclamationmark.triangle")
+                } description: {
+                    Text(problem)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+        .frame(minWidth: 520, minHeight: 420)
+        .task { await fetch.run() }
+    }
+}
+
+@MainActor
+final class PreviewFetch: ObservableObject {
+    enum Stage: Equatable {
+        case fetching
+        case ready
+        case refused(String)
+    }
+
+    @Published private(set) var stage: Stage = .fetching
+
+    private let file: DriveFile
+    private let offline: OfflineStore
+
+    init(file: DriveFile, offline: OfflineStore) {
+        self.file = file
+        self.offline = offline
+    }
+
+    func run() async {
+        guard case .fetching = stage else { return }
+        if let problem = await offline.downloadForPreview(driveID: file.id,
+                                                         declaredBytes: file.byteCount) {
+            stage = .refused(problem)
+        } else {
+            stage = .ready
+        }
     }
 }
 

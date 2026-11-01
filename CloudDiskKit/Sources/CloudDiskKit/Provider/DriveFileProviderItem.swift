@@ -58,13 +58,14 @@ public final class DriveFileProviderItem: NSObject, NSFileProviderItem {
 
     /// Wraps a Drive file as it appeared in `parent`, optionally pinned for offline use.
     static func make(from file: DriveFile,
-                     contentPolicy: NSFileProviderContentPolicy = .inherited) -> DriveFileProviderItem {
+                     contentPolicy: NSFileProviderContentPolicy = .inherited,
+                     rootFolderID: String? = nil) -> DriveFileProviderItem {
         let identifier = ProviderIdentity.identifier(forDriveID: file.id)
         let isFolder = file.isFolder
 
         return DriveFileProviderItem(Backing(
             identifier: identifier,
-            parentIdentifier: ProviderIdentity.parentIdentifier(for: file),
+            parentIdentifier: ProviderIdentity.parentIdentifier(for: file, rootFolderID: rootFolderID),
             filename: ProviderFilename.materializable(file.name),
             contentType: Self.contentType(of: file),
             capabilities: Self.capabilities(of: file),
@@ -72,9 +73,13 @@ public final class DriveFileProviderItem: NSObject, NSFileProviderItem {
             // make the system truncate or over-extend the materialized file.
             documentSize: isFolder ? nil : (file.hasMediaContent ? file.byteCount.map { NSNumber(value: $0) } : nil),
             childItemCount: nil,
-            creationDate: file.parsedCreatedTime,
-            modificationDate: file.parsedModifiedTime,
-            itemVersion: ProviderIdentity.itemVersion(for: file),
+            creationDate: file.fileProviderCreationDate,
+            modificationDate: file.fileProviderModificationDate,
+            itemVersion: ProviderIdentity.itemVersion(
+                for: file,
+                // One source of truth: the version tag and the policy are the same fact, so deriving
+                // one from the other means they can never be published out of step.
+                pinned: contentPolicy == .downloadEagerlyAndKeepDownloaded),
             isFolder: isFolder,
             isShared: file.shared ?? false,
             isSharedByCurrentUser: file.ownedByMe == false && (file.shared ?? false),
@@ -259,8 +264,16 @@ public final class DriveFileProviderItem: NSObject, NSFileProviderItem {
     public var isDownloading: Bool { false }
     public var isMostRecentVersionDownloaded: Bool { false }
 
+    /// The POSIX user bits FPFS puts on the materialized object.
+    ///
+    /// These are honored for directories since macOS 11.3, and a folder without `u+r` cannot be
+    /// listed at all: the system files it as mode `--x`, so `readdir` answers EACCES and Finder shows
+    /// an empty folder that never stops loading, however many children the provider published. Write
+    /// permission is not decided here — `capabilities` and Drive's own 403 are the gate — so a folder
+    /// always reports the `rwx` a user-owned directory has locally.
     public var fileSystemFlags: NSFileProviderFileSystemFlags {
-        backing.isFolder ? [] : [.userReadable, .userWritable]
+        backing.isFolder ? [.userReadable, .userWritable, .userExecutable]
+                         : [.userReadable, .userWritable]
     }
 
     /// Items are equal when they describe the same Drive object at the same version, which is what

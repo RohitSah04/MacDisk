@@ -10,5 +10,17 @@
 	<array>
 		<string>$(AppIdentifierPrefix)dev.rohitsah.clouddisk</string>
 	</array>
+	<!-- The app previews and streams the files its own File Provider domain mounts, and a sandboxed
+	     process gets no access to ~/Library/CloudStorage by default. Without this, Quick Look's helper
+	     service — which borrows the requesting app's profile — is denied the read and the sheet shows a
+	     document icon instead of the file. Scoped read-only to CloudDisk's own mount: the extension
+	     writes through File Provider APIs, not this path, so nothing here grants write access, and no
+	     other provider's files (iCloud Drive, Dropbox) become readable.
+	     The path is `~/Library/CloudStorage/<displayName>-<domainName>`, i.e. the mount
+	     CloudDiskDomain.make() produces for CloudDiskConfig.displayName. -->
+	<key>com.apple.security.temporary-exception.files.home-relative-path.read-only</key>
+	<array>
+		<string>/Library/CloudStorage/CloudDisk-CloudDisk/</string>
+	</array>
 </dict>
 </plist>

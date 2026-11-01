@@ -99,6 +99,22 @@ public struct DriveFile: Decodable, Equatable, Sendable, Identifiable {
     public var parsedCreatedTime: Date? { createdTime.flatMap { DriveDate.parse($0) } }
     public var parsedModifiedTime: Date? { modifiedTime.flatMap { DriveDate.parse($0) } }
 
+    /// The date to hand File Provider for "last changed", preferring `modifiedTime`.
+    ///
+    /// A file whose modification timestamp predates what the system can store falls back to its
+    /// creation time, which is the next best statement about the file; reporting the unusable date
+    /// instead would have the system silently rewrite it.
+    public var fileProviderModificationDate: Date? {
+        DriveDate.representableForFileProvider(parsedModifiedTime)
+            ?? DriveDate.representableForFileProvider(parsedCreatedTime)
+    }
+
+    /// As `fileProviderModificationDate`, preferring `createdTime`.
+    public var fileProviderCreationDate: Date? {
+        DriveDate.representableForFileProvider(parsedCreatedTime)
+            ?? DriveDate.representableForFileProvider(parsedModifiedTime)
+    }
+
     /// Content version token used for `NSFileProviderItemVersion.contentVersion`.
     ///
     /// Prefers the opaque revision, then the checksum, then the modification timestamp so that a
@@ -115,34 +131,47 @@ public struct DriveFile: Decodable, Equatable, Sendable, Identifiable {
 
     public static let rootFolderID = "root"
 
-    /// Fields requested from the API. Kept in one place so the response decoder and the query
-    /// string can never disagree.
+    /// Fields requested from the API. Kept in one place so the response decoder and the query string
+    /// can never disagree.
+    ///
+    /// Drive validates `fields` strictly, including every nested leaf, and answers a name that its
+    /// own schema does not define with `400 Invalid field selection <name>` for the *entire* request.
+    /// Two of those names (`picture`, `targetType`) and two capability flags are v2 vocabulary that
+    /// never existed in v3, and one bad name was enough to make every folder enumerate as empty.
+    /// `DriveV3FieldSelectionTests` holds this list against a transcription of the v3 schema.
     public static let fields = [
         "kind", "id", "name", "mimeType", "description", "fileExtension", "size", "version",
         "md5Checksum", "parents", "trashed", "starred", "shared", "ownedByMe", "createdTime",
-        "modifiedTime", "lastModifyingUser(displayName,emailAddress,photoLink,picture)",
-        "owners(displayName,emailAddress,picture)", "exportLinks", "thumbnailLink", "iconLink",
-        "shortcutDetails(targetId,targetMimeType,targetType)",
-        "capabilities(canEdit,canDownload,canTrash,canCopy,canAddChildren,canMoveItemOutOfWorld,"
-            + "canRemoveChildren,canUpdate,canShare,canDeleteChildren)"
+        "modifiedTime", "lastModifyingUser(displayName,emailAddress,photoLink)",
+        "owners(displayName,emailAddress,photoLink)", "exportLinks", "thumbnailLink", "iconLink",
+        "shortcutDetails(targetId,targetMimeType)",
+        "capabilities(canEdit,canDownload,canTrash,canCopy,canAddChildren,"
+            + "canMoveItemWithinDrive,canMoveItemOutOfDrive,"
+            + "canRemoveChildren,canShare,canDeleteChildren)"
     ].joined(separator: ",")
 
-    public static let listFields = "kind,files(\(fields)),nextPageToken,newPageToken"
+    /// `newPageToken` is deliberately absent: v3's `FileList` has only `kind`, `nextPageToken`,
+    /// `incompleteSearch` and `files`.
+    public static let listFields = "kind,files(\(fields)),nextPageToken"
+    /// `removes` and `mutationId` are deliberately absent: v3's `ChangeList` has `kind`,
+    /// `newStartPageToken`, `nextPageToken` and `changes`, and v3's `Change` has no mutation id.
+    /// Item-level removals arrive as `changes.removed` instead.
     public static let changesFields =
-        "kind,newStartPageToken,nextPageToken,removes,changes(kind,fileId,file(\(fields)),removed,mutationId)"
+        "kind,newStartPageToken,nextPageToken,changes(kind,fileId,file(\(fields)),removed)"
+
+    /// The three fields a delete decision is made from, and nothing else.
+    public static let deleteDecisionFields = "id,trashed,capabilities(canTrash,canEdit)"
 }
 
 public struct DriveUser: Decodable, Equatable, Sendable {
     public let displayName: String?
     public let emailAddress: String?
-    public let picture: String?
     public let photoLink: String?
 }
 
 public struct DriveShortcutDetails: Decodable, Equatable, Sendable {
     public let targetId: String?
     public let targetMimeType: String?
-    public let targetType: String?
 }
 
 public struct DriveCapabilities: Decodable, Equatable, Sendable {
@@ -152,14 +181,17 @@ public struct DriveCapabilities: Decodable, Equatable, Sendable {
     public let canCopy: Bool?
     public let canAddChildren: Bool?
     public let canRemoveChildren: Bool?
-    public let canMoveItemOutOfWorld: Bool?
-    public let canUpdate: Bool?
+    /// v3's two move flags. Drive documents both as depending on the parent being swapped, and v2's
+    /// `canMoveItemOutOfWorld` never existed here, so CloudDisk asks for the pair and only refuses a
+    /// move when neither one allows it.
+    public let canMoveItemWithinDrive: Bool?
+    public let canMoveItemOutOfDrive: Bool?
     public let canShare: Bool?
     public let canDeleteChildren: Bool?
 
     public init(canEdit: Bool? = nil, canDownload: Bool? = nil, canTrash: Bool? = nil,
                 canCopy: Bool? = nil, canAddChildren: Bool? = nil, canShare: Bool? = nil,
-                canMoveItemOutOfWorld: Bool? = nil) {
+                canMoveItemWithinDrive: Bool? = nil, canMoveItemOutOfDrive: Bool? = nil) {
         self.canEdit = canEdit
         self.canDownload = canDownload
         self.canTrash = canTrash
@@ -167,8 +199,8 @@ public struct DriveCapabilities: Decodable, Equatable, Sendable {
         self.canAddChildren = canAddChildren
         self.canShare = canShare
         self.canRemoveChildren = nil
-        self.canMoveItemOutOfWorld = canMoveItemOutOfWorld
-        self.canUpdate = nil
+        self.canMoveItemWithinDrive = canMoveItemWithinDrive
+        self.canMoveItemOutOfDrive = canMoveItemOutOfDrive
         self.canDeleteChildren = nil
     }
 
@@ -177,7 +209,13 @@ public struct DriveCapabilities: Decodable, Equatable, Sendable {
     public var isReadable: Bool { canDownload ?? true }
     public var isDeletable: Bool { canTrash ?? canEdit ?? false }
     public var isRenameable: Bool { canEdit ?? false }
-    public var isMoveable: Bool { (canEdit ?? false) && (canMoveItemOutOfWorld ?? true) }
+    /// Unknown answers count as allowed: Drive only populates these where the restriction is real.
+    public var isMoveable: Bool {
+        guard canEdit ?? false else { return false }
+        let blockedWithin = canMoveItemWithinDrive == false
+        let blockedOutOfDrive = canMoveItemOutOfDrive == false
+        return !(blockedWithin && blockedOutOfDrive)
+    }
     public var acceptsChildren: Bool { canAddChildren ?? false }
 }
 
@@ -234,5 +272,22 @@ public enum DriveDate {
         if let date = fractional.date(from: string) { return date }
         if let date = plain.date(from: string) { return date }
         return nil
+    }
+
+    /// The oldest timestamp File Provider can store, in seconds since 1970 — 1677-09-21.
+    ///
+    /// The system keeps dates as int64 nanoseconds, so it clamps anything older to this boundary.
+    /// Clamping is invisible to the provider but not to the user: Finder shows the boundary year and
+    /// the object on disk no longer matches the item that was reported, which `fileproviderctl check`
+    /// flags as `different_content_modification_date` on every run until the domain is rebuilt.
+    public static let fileProviderDateFloor = Date(timeIntervalSince1970: -9_223_372_036)
+
+    /// The date, or nil when File Provider would have to clamp it.
+    ///
+    /// Worth checking because Drive really does answer `1601-01-01T00:00:00Z` — a zero Windows
+    /// FILETIME — for files imported from other systems.
+    public static func representableForFileProvider(_ date: Date?) -> Date? {
+        guard let date, date >= fileProviderDateFloor else { return nil }
+        return date
     }
 }

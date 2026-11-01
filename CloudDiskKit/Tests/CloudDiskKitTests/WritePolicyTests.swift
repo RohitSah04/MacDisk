@@ -41,14 +41,30 @@ final class WritePolicyTests: XCTestCase {
         }
     }
 
-    func testTheMoveFlagRefusesOnlyTheMove() {
-        let locked = DriveCapabilities(canEdit: true, canMoveItemOutOfWorld: false)
+    func testTheMoveFlagsRefuseOnlyTheMove() {
+        let locked = DriveCapabilities(canEdit: true, canMoveItemWithinDrive: false,
+                                       canMoveItemOutOfDrive: false)
         XCTAssertEqual(WritePolicy.refusal(for: [.parentItemIdentifier],
                                            on: file(capabilities: locked)),
                        .itemLockedInFolder(name: "notes.txt"))
         XCTAssertNil(WritePolicy.refusal(for: [.contents], on: file(capabilities: locked)),
                      "editing inside the folder is allowed even when leaving it is not")
         XCTAssertNil(WritePolicy.refusal(for: [.filename], on: file(capabilities: locked)))
+    }
+
+    func testAMoveDriveHasOnlyRuledOutInOneDirectionIsNotRefused() {
+        // Drive answers these two against the drive the item is in and warns that either can depend on
+        // the parent being swapped, so one false says nothing about the other direction.
+        let staysInside = DriveCapabilities(canEdit: true, canMoveItemWithinDrive: true,
+                                            canMoveItemOutOfDrive: false)
+        let leavesDrive = DriveCapabilities(canEdit: true, canMoveItemWithinDrive: false,
+                                            canMoveItemOutOfDrive: true)
+        let onlyOneSaid = DriveCapabilities(canEdit: true, canMoveItemOutOfDrive: false)
+        for permissions in [staysInside, leavesDrive, onlyOneSaid] {
+            XCTAssertNil(WritePolicy.refusal(for: [.parentItemIdentifier],
+                                             on: file(capabilities: permissions)),
+                         "\(permissions) still leaves one direction Drive has not ruled out")
+        }
     }
 
     func testAnItemInTheTrashIsRefusedOnItsFlagRatherThanOnItsPermissions() {

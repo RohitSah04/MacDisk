@@ -102,7 +102,12 @@ public struct URLSessionTransport: HTTPTransport {
             if error.code == .cancelled { throw DriveError.cancelled }
             throw DriveError.network(detail: error.localizedDescription)
         } catch {
-            throw DriveError.network(detail: error.localizedDescription)
+            // Anything else happened on this Mac — a file that could not be written, a handle that
+            // could not be closed. Only a `URLError` may be reported as a network failure, because
+            // that code tells the system the server is unreachable and takes the whole domain
+            // offline, which is the wrong diagnosis for a local one and stops the user from
+            // retrying.
+            throw error
         }
     }
 
@@ -126,8 +131,7 @@ public struct URLSessionTransport: HTTPTransport {
 
         // The downloaded file is owned by URLSession and lives outside our container; the
         // destination is not expected to exist yet, so move rather than copy.
-        try FileManager.default.removeItem(at: destination)
-        try FileManager.default.moveItem(at: temporaryURL, to: destination)
+        try DownloadedFile.place(from: temporaryURL, to: destination)
 
         return HTTPResponse(
             statusCode: http.statusCode,
@@ -144,6 +148,20 @@ public struct URLSessionTransport: HTTPTransport {
             }
         }
         return map
+    }
+}
+
+/// Puts the file URLSession wrote into the place CloudDisk asked for.
+///
+/// `moveItem` will not overwrite, so a destination left behind by an earlier attempt has to go first —
+/// and only then. Removing a path that was never created throws, and a throw here would fail a
+/// download whose bytes had already arrived intact.
+enum DownloadedFile {
+    static func place(from source: URL, to destination: URL) throws {
+        if FileManager.default.fileExists(atPath: destination.path) {
+            try FileManager.default.removeItem(at: destination)
+        }
+        try FileManager.default.moveItem(at: source, to: destination)
     }
 }
 

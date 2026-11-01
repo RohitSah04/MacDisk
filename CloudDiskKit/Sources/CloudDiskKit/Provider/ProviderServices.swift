@@ -15,14 +15,39 @@ public final class ProviderServices: @unchecked Sendable {
     public let cacheSystem: any CacheSystem
     /// Pinning, cache measurement and eviction, shared by the app and the extension.
     public let offline: OfflineStore
+    /// What this process is transferring at this moment, so a sweep cannot free a file mid-download.
+    public let activeReads: ActiveReadRegistry
+    /// The idle-copy sweep. Each process holds its own; the throttle that keeps them from both working
+    /// is in shared state, not in memory.
+    public let eviction: AutoEvictionSweeper
     let manager: NSFileProviderManager?
+
+    /// Drive's real id for the account's "My Drive" folder, or nil until a root listing has been seen.
+    ///
+    /// Read while building every item, so it is guarded rather than re-read from the shared state file
+    /// for each object a changes drain publishes.
+    private let rootIDGate = NSLock()
+    private var rootFolderIDValue: String?
+
+    var driveRootFolderID: String? {
+        rootIDGate.lock()
+        defer { rootIDGate.unlock() }
+        return rootFolderIDValue
+    }
+
+    private func setDriveRootFolderID(_ id: String) {
+        rootIDGate.lock()
+        rootFolderIDValue = id
+        rootIDGate.unlock()
+    }
 
     public init(config: CloudDiskConfig,
                 drive: DriveService,
                 state: ProviderState,
                 manager: NSFileProviderManager? = nil,
                 cacheSystem: (any CacheSystem)? = nil,
-                cacheTTL: TimeInterval = 10) {
+                cacheTTL: TimeInterval = 10,
+                evictionConfig: AutoEviction.Config = .standard) {
         self.config = config
         self.drive = drive
         self.state = state
@@ -32,7 +57,14 @@ public final class ProviderServices: @unchecked Sendable {
             ?? manager.map { FileProviderCacheSystem(manager: $0) }
             ?? UnavailableCacheSystem()
         self.cacheSystem = system
-        self.offline = OfflineStore(state: state, cacheSystem: system)
+        let store = OfflineStore(state: state, cacheSystem: system)
+        self.offline = store
+        let reads = ActiveReadRegistry()
+        self.activeReads = reads
+        self.eviction = AutoEvictionSweeper(store: store,
+                                            state: state,
+                                            config: evictionConfig,
+                                            activeReads: { reads.snapshot() })
     }
 
     /// Builds the whole dependency graph from an Info.plist-derived configuration.
@@ -43,7 +75,8 @@ public final class ProviderServices: @unchecked Sendable {
                             domain: NSFileProviderDomain?,
                             transport: HTTPTransport = URLSessionTransport.shared,
                             store: CredentialStore? = nil,
-                            exchanger: TokenExchanging? = nil) throws -> ProviderServices {
+                            exchanger: TokenExchanging? = nil,
+                            bundle: Bundle = .main) throws -> ProviderServices {
         let credentialStore = store ?? KeychainCredentialStore.current(config: config)
         let tokens = TokenProvider(config: config,
                                    store: credentialStore,
@@ -51,7 +84,8 @@ public final class ProviderServices: @unchecked Sendable {
         let drive = DriveService(config: config, tokens: tokens, transport: transport)
         let state = try ProviderState.shared(config: config)
         let manager = domain.flatMap { NSFileProviderManager(for: $0) }
-        return ProviderServices(config: config, drive: drive, state: state, manager: manager)
+        return ProviderServices(config: config, drive: drive, state: state, manager: manager,
+                                evictionConfig: AutoEviction.Config.current(bundle: bundle))
     }
 
     /// Tells the system that new working-set changes are waiting.
@@ -102,23 +136,51 @@ public final class ProviderServices: @unchecked Sendable {
 
 extension ProviderServices {
 
+    /// Loads the remembered My Drive id once per process, so a relaunch does not have to re-learn it
+    /// before Finder shows anything.
+    func ensureDriveRootFolderID() async {
+        guard driveRootFolderID == nil else { return }
+        guard let stored = await state.driveRootFolderID() else { return }
+        setDriveRootFolderID(stored)
+    }
+
+    /// Records the id Drive used for the parent of a root listing.
+    ///
+    /// The listing itself is the cheapest certain answer: every child of My Drive names that folder in
+    /// `parents`, so the provider learns the alias from the response it is about to publish and needs
+    /// no extra request.
+    func observeRootListing(parentDriveID: String, files: [DriveFile]) async {
+        guard parentDriveID == ProviderIdentity.driveRootID else { return }
+        guard let observed = files.lazy.compactMap(\.parentID).first,
+              observed != driveRootFolderID else { return }
+        setDriveRootFolderID(observed)
+        try? await state.setDriveRootFolderID(observed)
+    }
+
     /// Items are built with the offline pin the user set in CloudDisk translated into the system's
     /// own content policy, so "keep downloading" and eviction are decided by FPFS rather than by a
     /// provider-side download loop.
-    func item(for file: DriveFile, pinned: Bool) -> NSFileProviderItem {
-        DriveFileProviderItem.make(from: file,
-                                   contentPolicy: DriveFileProviderItem
-                                                    .contentPolicy(pinned: pinned))
+    ///
+    /// The My Drive alias is resolved first, because a top-level object parented to its raw folder id
+    /// belongs to no container the system knows and disappears from the replica.
+    func item(for file: DriveFile, pinned: Bool) async -> NSFileProviderItem {
+        await ensureDriveRootFolderID()
+        return DriveFileProviderItem.make(from: file,
+                                          contentPolicy: DriveFileProviderItem
+                                                           .contentPolicy(pinned: pinned),
+                                          rootFolderID: driveRootFolderID)
     }
 
     func item(for file: DriveFile) async -> NSFileProviderItem {
-        item(for: file, pinned: await state.isPinned(file.id))
+        await item(for: file, pinned: await state.isPinned(file.id))
     }
 
     /// One pin-set read for a whole page of results, and the metadata is put in the cache so the
     /// `item(for:)` calls the system makes right after an enumeration stay local.
     func items(from files: [DriveFile]) async -> [NSFileProviderItem] {
+        await ensureDriveRootFolderID()
         let pins = await state.pinnedDriveIDs()
+        let rootFolderID = driveRootFolderID
         var result: [NSFileProviderItem] = []
         result.reserveCapacity(files.count)
         for file in files {
@@ -127,7 +189,8 @@ extension ProviderServices {
             result.append(DriveFileProviderItem.make(
                 from: resolved,
                 contentPolicy: DriveFileProviderItem
-                    .contentPolicy(pinned: pins.contains(resolved.id))))
+                    .contentPolicy(pinned: pins.contains(resolved.id)),
+                rootFolderID: rootFolderID))
         }
         return result
     }

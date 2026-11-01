@@ -69,15 +69,17 @@ struct FilesView: View {
             }
         }
         .sheet(item: $previewing) { target in
-            VStack(spacing: 0) {
-                HStack {
-                    Text(target.file.name).font(.headline).lineLimit(1)
-                    Spacer()
-                    Button("Done") { previewing = nil }
+            if let offline = core.services?.offline {
+                VStack(spacing: 0) {
+                    HStack {
+                        Text(target.file.name).font(.headline).lineLimit(1)
+                        Spacer()
+                        Button("Done") { previewing = nil }
+                    }
+                    .padding(12)
+                    Divider()
+                    PreviewView(file: target.file, url: target.url, offline: offline)
                 }
-                .padding(12)
-                Divider()
-                PreviewView(url: target.url)
             }
         }
     }
@@ -318,7 +320,7 @@ private struct FileRow: View {
                 .font(.callout.monospacedDigit())
                 .foregroundStyle(.secondary)
                 .frame(minWidth: 70, alignment: .trailing)
-            Text(DateText.modified(file.parsedModifiedTime))
+            Text(DateText.modified(file.fileProviderModificationDate))
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .frame(minWidth: 120, alignment: .trailing)

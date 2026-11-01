@@ -157,6 +157,34 @@ final class ProviderStateTests: XCTestCase {
         defaults.removePersistentDomain(forName: suiteName)
     }
 
+    // MARK: Mapping upgrade
+
+    func testLocationBuiltByAnOlderMappingIsMarkedForRebuild() throws {
+        let suiteName = "clouddisk-mapping-test-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        XCTAssertTrue(MappingUpgrade(suite: defaults).isNeeded(),
+                      "a location that never recorded a version was built by some older mapping")
+
+        defaults.set(MappingUpgrade.currentVersion, forKey: MappingUpgrade.key)
+        XCTAssertFalse(MappingUpgrade(suite: defaults).isNeeded())
+
+        defaults.set("1", forKey: MappingUpgrade.key)
+        XCTAssertTrue(MappingUpgrade(suite: defaults).isNeeded())
+    }
+
+    func testRecordingTheUpgradeIsWhatStopsTheRebuildRepeating() throws {
+        let suiteName = "clouddisk-mapping-test-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let upgrade = MappingUpgrade(suite: defaults)
+        XCTAssertTrue(upgrade.isNeeded())
+        upgrade.recordApplied()
+        XCTAssertFalse(MappingUpgrade(suite: defaults).isNeeded())
+    }
+
     // MARK: Error bridging
 
     func testAuthenticationFailureReachesTheSystemAsNotAuthenticated() {

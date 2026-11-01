@@ -327,7 +327,7 @@ public struct DriveService: Sendable {
         }
     }
 
-    /// The three fields a delete decision is made from, and nothing else.
+    /// Decodes `DriveFile.deleteDecisionFields`, and nothing else.
     ///
     /// `DriveFile` cannot be decoded from them — its `name` and `mimeType` are required — so a
     /// purpose-built resource is used rather than asking Drive for the whole object on every delete.
@@ -347,7 +347,7 @@ public struct DriveService: Sendable {
 
     private func trashState(of fileID: String) async throws -> TrashState {
         let query: [URLQueryItem] = [
-            URLQueryItem(name: "fields", value: "id,trashed,capabilities(canTrash,canEdit)"),
+            URLQueryItem(name: "fields", value: DriveFile.deleteDecisionFields),
             URLQueryItem(name: "supportsAllDrives", value: "true")
         ]
         let response = try await execute(jsonRequest(
@@ -421,12 +421,15 @@ public struct DriveService: Sendable {
     }
 
     public func changePage(from pageToken: String) async throws -> DriveChangesPage {
+        // `includeCorpusTrashes` and `includeRemovedEntries` are Drive v2 names. v3 rejects an
+        // unknown selection in `fields` outright, so the parameter list here has to match
+        // changes.list exactly.
         let query: [URLQueryItem] = [
             URLQueryItem(name: "pageToken", value: pageToken),
             URLQueryItem(name: "pageSize", value: String(pageSize)),
             URLQueryItem(name: "fields", value: DriveFile.changesFields),
-            URLQueryItem(name: "includeCorpusTrashes", value: "true"),
-            URLQueryItem(name: "includeRemovedEntries", value: "true"),
+            URLQueryItem(name: "includeCorpusRemovals", value: "true"),
+            URLQueryItem(name: "includeRemoved", value: "true"),
             URLQueryItem(name: "supportsAllDrives", value: "true")
         ]
         let response = try await execute(jsonRequest(
@@ -440,22 +443,20 @@ public struct DriveService: Sendable {
     /// Drains the changes feed from `pageToken` and returns the terminal `newStartPageToken`, which
     /// is what CloudDisk persists as its sync anchor.
     ///
-    /// `removes` can appear on any page of the drain, not just the last one, and it means Google
-    /// dropped part of the history this token covered. It is therefore accumulated across pages: a
-    /// feed that reported it early and then paged cleanly still has to expire the caller's anchor.
+    /// A token Google no longer honours answers `410 expiredStartPageToken`, which arrives here as
+    /// `DriveError.syncCursorExpired`; that is the only way v3 reports dropped history, so there is
+    /// no per-page flag to accumulate.
     public func collectChanges(from pageToken: String,
                               maxPages: Int = 50) async throws -> DriveChangeBatch {
         var changes: [DriveChange] = []
         var cursor = pageToken
         var newStart: String?
-        var removedEverything = false
         var pagesRead = 0
 
         while true {
             let page = try await changePage(from: cursor)
             changes.append(contentsOf: page.changeList)
             newStart = page.newStartPageToken ?? newStart
-            removedEverything = removedEverything || (page.removes ?? false)
             pagesRead += 1
 
             guard let next = page.nextPageToken, !next.isEmpty else { break }
@@ -463,7 +464,6 @@ public struct DriveService: Sendable {
                 // `next` is itself a valid changes pageToken, so the caller can resume from it and
                 // still make forward progress instead of losing everything drained so far.
                 return DriveChangeBatch(changes: changes, startPageToken: nil, resumeToken: next,
-                                        removedEverything: removedEverything,
                                         truncated: true)
             }
             try Task.checkCancellation()
@@ -474,7 +474,7 @@ public struct DriveService: Sendable {
             throw DriveError.invalidResponse(detail: "changes feed returned no newStartPageToken")
         }
         return DriveChangeBatch(changes: changes, startPageToken: newStart, resumeToken: nil,
-                                removedEverything: removedEverything, truncated: false)
+                                truncated: false)
     }
 
     // MARK: Account
@@ -506,16 +506,14 @@ public struct DriveChangeBatch: Equatable, Sendable {
     public let startPageToken: String?
     /// Token to resume from when `truncated` is true.
     public let resumeToken: String?
-    public let removedEverything: Bool
     /// True when `maxPages` stopped the drain; the cursor is not yet current.
     public let truncated: Bool
 
     public init(changes: [DriveChange], startPageToken: String?, resumeToken: String?,
-                removedEverything: Bool, truncated: Bool) {
+                truncated: Bool) {
         self.changes = changes
         self.startPageToken = startPageToken
         self.resumeToken = resumeToken
-        self.removedEverything = removedEverything
         self.truncated = truncated
     }
 }

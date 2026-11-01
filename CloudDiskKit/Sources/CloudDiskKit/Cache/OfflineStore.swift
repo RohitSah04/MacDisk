@@ -13,9 +13,14 @@ public struct CachedItem: Sendable, Equatable {
     public let allocatedBytes: Int64?
     /// The length the item declares, which is the whole object even when only a window is on disk.
     public let declaredBytes: Int64?
+    /// The user-immutable flag on the replica's path. Something outside CloudDisk — Finder's own lock, a
+    /// terminal `chflags uchg` — put it there, and it is the one signal on disk that the copy must not
+    /// move, so auto-eviction reads it before offering the item.
+    public let isLocked: Bool
 
     public init(identifier: NSFileProviderItemIdentifier, driveID: String?, name: String,
-                isFolder: Bool, isPinned: Bool, allocatedBytes: Int64?, declaredBytes: Int64?) {
+                isFolder: Bool, isPinned: Bool, allocatedBytes: Int64?, declaredBytes: Int64?,
+                isLocked: Bool = false) {
         self.identifier = identifier
         self.driveID = driveID
         self.name = name
@@ -23,6 +28,7 @@ public struct CachedItem: Sendable, Equatable {
         self.isPinned = isPinned
         self.allocatedBytes = allocatedBytes
         self.declaredBytes = declaredBytes
+        self.isLocked = isLocked
     }
 }
 
@@ -71,8 +77,9 @@ public enum EvictionRefusal: String, Sendable, Equatable {
         case .pinned:
             return "kept offline, as you asked"
         case .nonEvictable:
-            return "marked as not removable — it is inside a folder you kept offline, or Finder is "
-                 + "holding it"
+            return "marked by Finder as not removable. A copy you once kept offline keeps that mark "
+                 + "until Finder reads the file again — it clears when the file changes on Drive, or "
+                 + "when you rebuild the Finder location on the Status tab"
         case .unsyncedEdits:
             return "still holds changes that have not reached Google Drive"
         case .inUse:
@@ -189,18 +196,33 @@ public actor OfflineStore {
                                     isFolder: isFolder,
                                     isPinned: entry.driveID.map { pins.contains($0) } ?? false,
                                     allocatedBytes: isFolder ? nil : reading?.allocatedBytes ?? nil,
-                                    declaredBytes: entry.declaredBytes))
+                                    declaredBytes: entry.declaredBytes,
+                                    isLocked: reading?.isLocked ?? false))
         }
         return CacheInventory(items: items, measuredAt: now)
     }
 
-    /// Disk blocks and type of one path, or nil when it cannot be read.
-    private func measure(_ url: URL) -> (allocatedBytes: Int64?, isDirectory: Bool)? {
+    /// Disk blocks, type and lock flag of one path, or nil when it cannot be read.
+    private func measure(_ url: URL) -> (allocatedBytes: Int64?, isDirectory: Bool, isLocked: Bool)? {
         guard fileManager.fileExists(atPath: url.path) else { return nil }
         let values = try? url.resourceValues(
             forKeys: [.totalFileAllocatedSizeKey, .isDirectoryKey])
         guard let values else { return nil }
-        return (values.totalFileAllocatedSize.map { Int64($0) }, values.isDirectory ?? false)
+        return (values.totalFileAllocatedSize.map { Int64($0) },
+                values.isDirectory ?? false,
+                Self.isLocked(url))
+    }
+
+    /// Whether something outside CloudDisk has marked this copy not to be moved.
+    ///
+    /// Read off the file's own flags rather than from any CloudDisk record, because the lock was not set
+    /// by us: Finder's lock, a terminal `chflags uchg` and a backup restore all leave the same mark, and
+    /// a sweep acting without being asked has no business overriding a decision it did not make. This is
+    /// `stat`'s immutable bit and nothing else, so an unreadable path reads as not locked.
+    static func isLocked(_ url: URL) -> Bool {
+        var attributes = stat()
+        guard stat(url.path, &attributes) == 0 else { return false }
+        return Int(attributes.st_flags) & Int(UF_IMMUTABLE) != 0
     }
 
     // MARK: Release
@@ -303,6 +325,131 @@ public actor OfflineStore {
                                       detail: detail))
     }
 
+    // MARK: Auto-eviction
+
+    /// Frees copies that have been idle at least `config.inactivityTimeout` for as long as the ledger
+    /// can prove it.
+    ///
+    /// Same mechanism as a manual "Clear cached files", and deliberately narrower. The manual press is
+    /// an explicit request for disk back, so it may offer every unpinned copy; this one acts without
+    /// being asked, so it offers only what it can show nobody wants, and every item it cannot show is
+    /// counted under the rule that kept it rather than being quietly skipped. Nothing here reaches
+    /// Google: this type holds no `DriveService`, and `evict` is the only mutating call it can make —
+    /// the original file is never in range.
+    public func sweepForInactivity(now: Date = Date(),
+                                   config: AutoEviction.Config = .standard,
+                                   activeReads: Set<String> = []) async throws
+        -> AutoEviction.Sweep {
+        let inventory = try await self.inventory()
+        let ledger = await state.accessTimes()
+        var report = EvictionReport()
+        var kept: [AutoEviction.Decision: Int] = [:]
+        var earliest: Date?
+
+        for item in inventory.items {
+            let facts = item.accessFacts(ledger: ledger, activeReads: activeReads)
+            let decision = AutoEviction.decide(facts, now: now, config: config)
+            report.scanned += 1
+
+            if decision == .evict, let driveID = item.driveID {
+                let releasedBefore = report.released.count
+                try await release(item, into: &report)
+                ProviderLog.note("evict release \(driveID) bytes=\(item.allocatedBytes ?? 0)"
+                                 + " released=\(report.released.count > releasedBefore)")
+                // Only a copy that actually went loses its history. A refused one is still there and
+                // still idle, and forgetting its timestamp would make it unmeasurable forever.
+                if report.released.count > releasedBefore { await state.forgetAccess(driveID) }
+                continue
+            }
+
+            kept[decision, default: 0] += 1
+            if let remaining = decision.retryIn {
+                let candidate = now.addingTimeInterval(remaining)
+                if earliest == nil || candidate < earliest! { earliest = candidate }
+            }
+        }
+
+        // Ids whose copy is gone and which have not been seen for the retention window are dropped, so
+        // the ledger tracks this Mac's cache rather than everywhere the account has ever been.
+        let present = Set(inventory.items.compactMap { $0.isFolder ? nil : $0.driveID })
+        await state.pruneAccess(knownDriveIDs: present,
+                                olderThan: now.addingTimeInterval(-config.ledgerRetention))
+
+        let sweep = AutoEviction.Sweep(report: report, kept: kept, nextEligibleAt: earliest)
+        await recordAutoEviction(sweep)
+        return sweep
+    }
+
+    /// A user-facing line only when bytes actually moved.
+    ///
+    /// A pass that freed nothing is the normal state of a Mac whose files are all fresh, and recording
+    /// one every few minutes would bury the operations the Activity screen exists to show.
+    private func recordAutoEviction(_ sweep: AutoEviction.Sweep) async {
+        guard !sweep.report.released.isEmpty else { return }
+        let keptTotal = sweep.kept.values.reduce(0, +)
+        let detail = "Freed \(sweep.report.released.count) idle "
+                   + (sweep.report.released.count == 1 ? "copy" : "copies")
+                   + (keptTotal == 0 ? "" : "; kept \(keptTotal) still in use or too new")
+        try? await state.record(.init(kind: .synchronize,
+                                      outcome: sweep.report.failures.isEmpty ? .success : .failure,
+                                      subject: "Local cache",
+                                      detail: detail))
+    }
+    // MARK: Preview support
+
+    /// Whether an object still has bytes to fetch before Quick Look can be pointed at it.
+    ///
+    /// Allocated blocks rather than the logical length, because a dataless replica reports Drive's full
+    /// size while holding none of the content — comparing lengths would answer "already there" for
+    /// every file in the drive. An object Drive gives no size for is a Google-native document, which
+    /// has no downloadable content at all, so waiting for one would wait forever.
+    static func needsDownload(declaredBytes: Int64?, allocatedBytes: Int64?) -> Bool {
+        guard let declaredBytes, declaredBytes > 0 else { return false }
+        guard let allocatedBytes else { return true }
+        return allocatedBytes < declaredBytes
+    }
+
+    /// Brings one object's content to disk so a preview has something to open.
+    ///
+    /// Quick Look's helper asks the thumbnailing daemon for a copy of the file instead of reading the
+    /// replica, and that daemon gives up on a dataless item rather than waiting for File Provider to
+    /// fetch it — Finder's space-bar does wait, which is why the same file previews there and shows a
+    /// bare document icon here. Fetching first is what turns the placeholder into the file.
+    ///
+    /// - Returns: nil once the whole object is on disk, or the sentence explaining why it is not.
+    public func downloadForPreview(driveID: String,
+                                   declaredBytes: Int64?,
+                                   timeout: TimeInterval = 120) async -> String? {
+        guard await isMissingBytes(driveID: driveID, declaredBytes: declaredBytes) else { return nil }
+
+        let identifier = ProviderIdentity.identifier(forDriveID: driveID)
+        if let error = await cacheSystem.requestFullDownload(identifier) {
+            return Self.describe(error)
+        }
+        let deadline = ContinuousClock.now.advanced(by: .seconds(timeout))
+        while ContinuousClock.now < deadline {
+            do {
+                try await Task.sleep(nanoseconds: Self.previewPollIntervalNanoseconds)
+            } catch {
+                // The sheet went away; nobody is waiting for this answer any more.
+                return nil
+            }
+            guard await isMissingBytes(driveID: driveID, declaredBytes: declaredBytes) else { return nil }
+        }
+        return "The copy did not finish arriving within \(Int(timeout)) seconds, so there is nothing to "
+             + "open yet. Finder keeps fetching the file in the background — try again in a moment, or "
+             + "use \"Keep offline\" to hold it on this Mac."
+    }
+
+    private func isMissingBytes(driveID: String, declaredBytes: Int64?) async -> Bool {
+        let identifier = ProviderIdentity.identifier(forDriveID: driveID)
+        let allocated = await cacheSystem.userVisibleURL(for: identifier)
+            .flatMap { measure($0)?.allocatedBytes }
+        return Self.needsDownload(declaredBytes: declaredBytes, allocatedBytes: allocated)
+    }
+
+    private static let previewPollIntervalNanoseconds: UInt64 = 400_000_000
+
     // MARK: Pinning
 
     public func pinnedDriveIDs() async -> Set<String> {
@@ -370,9 +517,28 @@ public actor OfflineStore {
         case .downloadDeferred:
             return "Kept offline; downloads as soon as Finder lists the file"
         case .policyPublished:
-            return "No longer kept offline; the copy on disk can be freed"
+            // Not "the copy on disk can be freed": Finder keeps the mark it read when the file was kept
+            // offline until it reads the file again, so promising the bytes back here would be a lie the
+            // next "Clear cached files" would expose.
+            return "No longer kept offline. Finder holds the copy already on disk until it re-reads "
+                 + "the file; new copies can be freed normally"
         case .refused(let reason), .systemUnavailable(let reason):
             return reason
         }
+    }
+}
+
+extension CachedItem {
+    /// The facts the eviction rule needs about this row, with the ledger and this process's live
+    /// transfers folded in.
+    func accessFacts(ledger: [String: Date], activeReads: Set<String>) -> AutoEviction.Facts {
+        AutoEviction.Facts(driveID: driveID,
+                           isFolder: isFolder,
+                           isPinned: isPinned,
+                           allocatedBytes: allocatedBytes,
+                           declaredBytes: declaredBytes,
+                           lastAccessedAt: driveID.flatMap { ledger[$0] },
+                           isActiveRead: driveID.map { activeReads.contains($0) } ?? false,
+                           isLockedOnDisk: isLocked)
     }
 }

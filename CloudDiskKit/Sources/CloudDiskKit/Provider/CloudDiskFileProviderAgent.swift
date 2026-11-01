@@ -45,6 +45,14 @@ open class CloudDiskFileProviderAgent: NSObject, NSFileProviderReplicatedExtensi
         // unlinking it; the provider, not the system, owns those bytes.
         built?.sweepStaleTemporaryFiles()
         beat()
+
+        // Copies left over from an earlier session are only ever given back by a sweep, and being
+        // launched is the only moment this extension is guaranteed to exist while the app is closed —
+        // so every start asks for one pass, shortly after the mount has had room to come up.
+        if let built {
+            let delay = built.eviction.config.firstSweepDelay
+            Task { await built.eviction.schedule(after: delay, reason: "extension start") }
+        }
     }
 
     // MARK: - Lifecycle
@@ -55,6 +63,11 @@ open class CloudDiskFileProviderAgent: NSObject, NSFileProviderReplicatedExtensi
         let running = inFlight.allObjects
         gate.unlock()
         (running as? [any OperationCanceling])?.forEach { $0.cancelRunningWork() }
+        // A scheduled pass belongs to this instance. The system is discarding it, and a sweep that
+        // starts after that would be evicting through a provider nobody is asking anything of.
+        if let services {
+            Task { await services.eviction.cancelPending() }
+        }
     }
 
     /// Records which appex the system is running for this domain. The app compares that path with its
@@ -69,6 +82,7 @@ open class CloudDiskFileProviderAgent: NSObject, NSFileProviderReplicatedExtensi
 
     open func enumerator(for containerItemIdentifier: NSFileProviderItemIdentifier,
                          request: NSFileProviderRequest) throws -> NSFileProviderEnumerator {
+        ProviderLog.note("enumerator for \(containerItemIdentifier.rawValue)")
         beat()
         guard let core else {
             throw ProviderErrorMapper.bridge(setupFailure ?? DriveError.misconfigured(

@@ -85,6 +85,8 @@ final class AppCore: ObservableObject {
     let domain = CloudDiskDomain.make()
     private(set) var services: ProviderServices?
     private var config: CloudDiskConfig?
+    private let mappingUpgrade = MappingUpgrade()
+    private var locationSyncWatch: Task<Void, Never>?
 
     var isConnected: Bool {
         if case .connected = account { return true }
@@ -124,12 +126,59 @@ final class AppCore: ObservableObject {
 
         await readCredential()
         checkKeychain()
+        let locationExistedBeforeLaunch = await CloudDiskDomain.isRegistered()
         await registerLocation()
+        await applyMappingUpgrade(locationExistedBeforeLaunch: locationExistedBeforeLaunch)
         await refreshStorage()
         await refreshLocalCache()
         await refreshActivity()
         await verifyExtension()
+        startLocationSyncWatch()
     }
+
+    /// Brings a Finder location created by an older build up to this build's item mapping.
+    ///
+    /// Objects the system already materialized keep the dates and permissions of the item that created
+    /// them, so a mapping fix needs a re-import to be visible; a location registered by this launch is
+    /// already correct and only needs its version recorded.
+    private func applyMappingUpgrade(locationExistedBeforeLaunch: Bool) async {
+        guard mappingUpgrade.isNeeded() else { return }
+        if locationExistedBeforeLaunch {
+            await rebuildLocation()
+            guard case .registered = location else { return }
+        }
+        mappingUpgrade.recordApplied()
+    }
+
+    // MARK: Keeping the mounted folder in step with Drive
+
+    /// Tells File Provider that Drive has new metadata waiting, so the mounted folder follows a change
+    /// that did not come through it.
+    ///
+    /// Nothing else asks for the changes feed. File Provider re-reads a container when a client looks
+    /// at it or when its own schedule says so, and Drive's push channel needs a public callback server
+    /// this app does not have, so without a nudge the folder keeps the names it imported and the user
+    /// reads that as sync being broken. Found by renaming a file in CloudDisk's own browser: Drive
+    /// answered with the new name, Finder still showed the old one, and nothing bridged the gap.
+    func syncFinderLocation() async {
+        guard isConnected else { return }
+        _ = await CloudDiskDomain.signalResync(domain)
+    }
+
+    /// One nudge per wait, so a file edited on a phone or in the browser appears in Finder without the
+    /// user reopening anything. Each pass costs the extension one `changes.list` call.
+    private func startLocationSyncWatch() {
+        locationSyncWatch?.cancel()
+        locationSyncWatch = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: Self.locationSyncInterval)
+                guard !Task.isCancelled else { return }
+                await self?.syncFinderLocation()
+            }
+        }
+    }
+
+    private static let locationSyncInterval: Duration = .seconds(120)
 
     // MARK: Account
 
@@ -154,6 +203,7 @@ final class AppCore: ObservableObject {
             await verifyExtension()
             await refreshStorage()
             await refreshActivity()
+            startLocationSyncWatch()
         } catch {
             account = .problem(error.localizedDescription)
         }
@@ -164,6 +214,7 @@ final class AppCore: ObservableObject {
     /// failure, and Drive drops the grant anyway when the account's app permissions are revoked.
     func signOut() async {
         account = .busy
+        locationSyncWatch?.cancel()
         await services?.drive.tokens.signOut()
         GoogleSignInBridge.signOut()
         storage = .unknown
@@ -250,6 +301,24 @@ final class AppCore: ObservableObject {
 
     func refreshLocation() async {
         await registerLocation()
+        await verifyExtension()
+    }
+
+    /// Removes and re-creates the Finder location so File Provider materializes every item again.
+    ///
+    /// The system takes an object's permissions from the item at the moment it creates the folder and
+    /// leaves them alone while that item's version is unchanged, so a folder created by an older
+    /// CloudDisk keeps whatever mode that build published — including one Finder cannot list. Rebuilding
+    /// is the only way to apply a corrected mapping to objects already on disk; the removal preserves
+    /// everything the user had downloaded.
+    func rebuildLocation() async {
+        location = .registering
+        switch await CloudDiskDomain.repair(domain) {
+        case .reregistered:
+            await reportRegistered()
+        case .failed(let message):
+            location = .blocked(message)
+        }
         await verifyExtension()
     }
 

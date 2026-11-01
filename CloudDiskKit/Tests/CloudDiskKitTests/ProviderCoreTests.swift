@@ -938,17 +938,19 @@ final class ProviderCoreTests: XCTestCase {
         await assertWriteRefused(harness, kind: .rename)
     }
 
-    func testAMoveOfAnItemThatCannotLeaveItsFolderIsRefused() async throws {
+    func testAMoveOfAnItemThatCannotMoveAtAllIsRefused() async throws {
         let other = "other0000000000000000000000000001"
         let remote = DriveFile(id: Self.fileID, name: "notes.txt", mimeType: "text/plain",
                                size: "1024", version: "rev-1", parents: [Self.folderID],
                                capabilities: DriveCapabilities(canEdit: true,
-                                                                    canMoveItemOutOfWorld: false))
+                                                               canMoveItemWithinDrive: false,
+                                                               canMoveItemOutOfDrive: false))
         let moved = DriveFile(id: Self.fileID, name: "notes.txt", mimeType: "text/plain",
                               size: "1024", version: "rev-1", parents: [other])
 
         let harness = harness([.json(remoteFile(with: ["canEdit": true,
-                                                      "canMoveItemOutOfWorld": false]))])
+                                                      "canMoveItemWithinDrive": false,
+                                                      "canMoveItemOutOfDrive": false]))])
         defer { try? FileManager.default.removeItem(at: harness.scratch) }
 
         do {
@@ -956,11 +958,37 @@ final class ProviderCoreTests: XCTestCase {
                                               baseVersion: ProviderIdentity.itemVersion(for: remote),
                                               changedFields: [.parentItemIdentifier], contents: nil,
                                               options: [], progress: Progress(totalUnitCount: 100))
-            XCTFail("someone else's folder cannot be emptied by dragging out of it")
+            XCTFail("Drive reported both move flags false, so no reparent can succeed")
         } catch {
-            assertWriteNotAllowed(error, contains: "will not let it leave")
+            assertWriteNotAllowed(error, contains: "does not let")
         }
         await assertWriteRefused(harness, kind: .move)
+    }
+
+    func testAMoveDriveHasNotRuledOutReachesGoogle() async throws {
+        let other = "other0000000000000000000000000001"
+        let remote = DriveFile(id: Self.fileID, name: "notes.txt", mimeType: "text/plain",
+                               size: "1024", version: "rev-1", parents: [Self.folderID],
+                               capabilities: DriveCapabilities(canEdit: true,
+                                                               canMoveItemWithinDrive: true,
+                                                               canMoveItemOutOfDrive: false))
+        let moved = DriveFile(id: Self.fileID, name: "notes.txt", mimeType: "text/plain",
+                              size: "1024", version: "rev-1", parents: [other])
+
+        let harness = harness([.json(remoteFile(with: ["canEdit": true,
+                                                      "canMoveItemWithinDrive": true,
+                                                      "canMoveItemOutOfDrive": false])),
+                              .json(DriveJSON.file(id: Self.fileID, name: "notes.txt",
+                                                   size: 1_024, version: "rev-1",
+                                                   parents: [other]))])
+        defer { try? FileManager.default.removeItem(at: harness.scratch) }
+
+        _ = try await harness.core.modify(DriveFileProviderItem.make(from: moved),
+                                          baseVersion: ProviderIdentity.itemVersion(for: remote),
+                                          changedFields: [.parentItemIdentifier], contents: nil,
+                                          options: [], progress: Progress(totalUnitCount: 100))
+        // Leaving the drive is forbidden but moving inside it is not, so the PATCH has to go out.
+        XCTAssertEqual(harness.transport.method(at: 1), "PATCH")
     }
 
     func testATrashedItemRefusesAWriteEvenWhenItIsMarkedEditable() async throws {
@@ -1206,6 +1234,60 @@ final class ProviderCoreTests: XCTestCase {
     }
 
     // MARK: Enumeration
+
+    func testARootListingIsFiledUnderTheRootContainerNotTheFolderDriveNames() async throws {
+        // The shape Drive actually answers with: `q: "'root' in parents"` works, but every child
+        // reports the account's My Drive id in `parents` rather than the alias. Anything parented to
+        // an identifier the system never received is dropped from the replica, and Finder shows an
+        // empty folder while the listing itself returned everything.
+        let myDriveID = "0AIzEQ6JILNiUk9PVAxxxxxxxxxxxxx"
+        let harness = harness([
+            .json(DriveJSON.page(files: [
+                DriveJSON.file(id: Self.fileID, name: "top.txt", size: 1_024, version: "rev-1",
+                               parents: [myDriveID]),
+                DriveJSON.file(id: Self.folderID, name: "Reports",
+                               mimeType: DriveFile.folderMimeType, parents: [myDriveID])
+            ]))
+        ])
+        defer { try? FileManager.default.removeItem(at: harness.scratch) }
+
+        let enumerator = DriveEnumerator(kind: .container(parentDriveID: ProviderIdentity.driveRootID),
+                                         services: harness.services)
+        let observer = RecordingEnumerationObserver()
+        enumerator.enumerateItems(for: observer, startingAt: NSFileProviderPage(Data()))
+        XCTAssertTrue(observer.waitForFinish())
+
+        let published = try XCTUnwrap(observer.batches.first)
+        XCTAssertEqual(published.count, 2)
+        for item in published {
+            XCTAssertEqual(item.parentItemIdentifier, ProviderIdentity.rootIdentifier,
+                           "\(item.filename) was published inside a container File Provider has no row for")
+        }
+    }
+
+    func testTheMyDriveIDIsRememberedForTheNextExtensionProcess() async throws {
+        let myDriveID = "0AIzEQ6JILNiUk9PVAxxxxxxxxxxxxx"
+        let topLevel = DriveJSON.file(id: Self.fileID, name: "top.txt", size: 1_024, version: "rev-1",
+                                      parents: [myDriveID])
+        let harness = harness([.json(DriveJSON.page(files: [topLevel]))])
+        defer { try? FileManager.default.removeItem(at: harness.scratch) }
+
+        let enumerator = DriveEnumerator(kind: .container(parentDriveID: ProviderIdentity.driveRootID),
+                                         services: harness.services)
+        let observer = RecordingEnumerationObserver()
+        enumerator.enumerateItems(for: observer, startingAt: NSFileProviderPage(Data()))
+        XCTAssertTrue(observer.waitForFinish())
+
+        // A fresh process: nothing in memory, only the shared state directory left behind.
+        let transport = StubTransport(script: [.json(topLevel)])
+        let environment = DriveTestEnvironment.make(transport: transport)
+        let relaunched = ProviderServices(config: environment.config, drive: environment.service,
+                                          state: harness.state, manager: nil, cacheTTL: 60)
+
+        let item = try await CloudDiskProviderCore(services: relaunched).item(for: Self.fileIdentifier)
+        XCTAssertEqual(item.parentItemIdentifier, ProviderIdentity.rootIdentifier,
+                       "a restart would otherwise empty Finder again until the folder was re-listed")
+    }
 
     func testAFolderWalksEveryPageAndCarriesTheDriveTokenThrough() async throws {
         let harness = harness([
@@ -1520,28 +1602,6 @@ final class ProviderCoreTests: XCTestCase {
                        "a change whose object is gone must delete the replica, not vanish")
     }
 
-    func testAFullDriveHistoryLossExpiresTheAnchorInsteadOfSilentlyRescanning() async throws {
-        let harness = harness([
-            .json(DriveJSON.changesPage(changes: [], newStartPageToken: "AAAAAAAAMW9",
-                                       removes: true))
-        ])
-        defer { try? FileManager.default.removeItem(at: harness.scratch) }
-        try await harness.state.setSyncCursor("AAAAAAAAMWQ")
-
-        let enumerator = DriveEnumerator(kind: .workingSet, services: harness.services)
-        let observer = RecordingChangeObserver()
-        enumerator.enumerateChanges(for: observer,
-                                    from: ProviderCursor.anchor(driveStartToken: "AAAAAAAAMWQ"))
-        XCTAssertTrue(observer.waitForFinish())
-
-        let error = try XCTUnwrap(observer.error)
-        XCTAssertEqual(error.code, NSFileProviderError.Code.syncAnchorExpired.rawValue,
-                       "only the system can rebuild the replica cheaply, so it has to be told")
-        let stored = await harness.state.syncCursor()
-        XCTAssertNil(stored, "the dead token is what currentSyncAnchor hands back, so it must go "
-                           + "with the anchor or the two sides loop on the same expiry forever")
-    }
-
     func testARejectedChangesTokenFromGoogleExpiresTheAnchorAndDropsTheToken() async throws {
         // The signal Google actually sends when it has dropped history: 410 on the token, not a
         // `removes` flag. Same handling, reached from the other side.
@@ -1595,6 +1655,29 @@ final class ProviderCoreTests: XCTestCase {
         let stored = await harness.state.syncCursor()
         XCTAssertNotEqual(stored, "AAAAAAAAMWZ",
                           "a partial drain has not reached the terminal token and must not claim it did")
+    }
+
+    func testAQuietChangesFeedStillMovesTheAnchorForward() async throws {
+        // Observed live: a poll that found nothing was answered with the very token it had been
+        // given, so the next poll re-read the same window and a change Google had already recorded
+        // never reached the Finder location.
+        let harness = harness([
+            .json(DriveJSON.changesPage(changes: [], newStartPageToken: "AAAAAAAAMWZ"))
+        ])
+        defer { try? FileManager.default.removeItem(at: harness.scratch) }
+        try await harness.state.setSyncCursor("AAAAAAAAMWQ")
+
+        let enumerator = DriveEnumerator(kind: .workingSet, services: harness.services)
+        let observer = RecordingChangeObserver()
+        enumerator.enumerateChanges(for: observer,
+                                    from: ProviderCursor.anchor(driveStartToken: "AAAAAAAAMWQ"))
+        XCTAssertTrue(observer.waitForFinish())
+
+        XCTAssertEqual(observer.anchorText, "AAAAAAAAMWZ")
+        XCTAssertFalse(observer.moreComing)
+        let stored = await harness.state.syncCursor()
+        XCTAssertEqual(stored, "AAAAAAAAMWZ",
+                       "an empty page still marks everything up to its token as seen")
     }
 
     func testAFolderEnumeratorReportsOnlyChangesInsideThatFolder() async throws {
@@ -1656,6 +1739,11 @@ final class ProviderCoreTests: XCTestCase {
         // Not `.downloadLazily`: an explicit child policy overrides the container's, so inheriting is
         // what lets a folder the user kept offline carry that pin down to this file.
         XCTAssertEqual(lazy.contentPolicy, .inherited)
+        // The policy alone is not enough: File Provider reads an item's policy once and keeps the
+        // answer while its version is unchanged, so a released pin that does not move the version is a
+        // pin the user can never undo — the replica stays marked non-evictable forever.
+        XCTAssertNotEqual(item.itemVersion?.metadataVersion, lazy.itemVersion?.metadataVersion)
+        XCTAssertEqual(item.itemVersion?.contentVersion, lazy.itemVersion?.contentVersion)
     }
 
     // MARK: Helpers

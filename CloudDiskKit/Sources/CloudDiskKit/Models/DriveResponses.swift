@@ -7,7 +7,6 @@ public struct DriveChange: Decodable, Equatable, Sendable {
     /// Present unless `removed` is true.
     public let file: DriveFile?
     public let removed: Bool?
-    public let mutationId: String?
 
     public var isRemoved: Bool { removed ?? false }
 }
@@ -17,8 +16,6 @@ public struct DriveChangesPage: Decodable, Equatable, Sendable {
     public let changes: [DriveChange]?
     public let nextPageToken: String?
     public let newStartPageToken: String?
-    /// True when Google dropped history and a full re-scan is required.
-    public let removes: Bool?
 
     public var changeList: [DriveChange] { changes ?? [] }
 }
@@ -56,8 +53,6 @@ public struct DriveChildrenPage: Decodable, Equatable, Sendable {
     public let kind: String?
     public let files: [DriveFile]?
     public let nextPageToken: String?
-    /// Opaque token valid for the *same* query only; used by the provider as the page cursor.
-    public let newPageToken: String?
 
     public var fileList: [DriveFile] { files ?? [] }
 }

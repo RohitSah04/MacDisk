@@ -41,7 +41,18 @@ public final class DriveEnumerator: NSObject, NSFileProviderEnumerator {
         super.init()
     }
 
+    /// Which of the three shapes this enumerator serves, in the form the system's own log uses so the
+    /// two can be read side by side.
+    private var kindLabel: String {
+        switch kind {
+        case .container(let parentDriveID): return "container(\(parentDriveID))"
+        case .trash: return "trash"
+        case .workingSet: return "workingSet"
+        }
+    }
+
     public func invalidate() {
+        ProviderLog.note("invalidate \(kindLabel)")
         stateGate.lock()
         isInvalidated = true
         let tasks = runningTasks
@@ -56,18 +67,27 @@ public final class DriveEnumerator: NSObject, NSFileProviderEnumerator {
         tasks.forEach { $0.cancel() }
     }
 
-    /// Starts work unless the system already discarded this enumerator, in which case the task is
-    /// cancelled and its observer gate closed before either can run.
-    private func track(_ task: Task<Void, Never>, gate: (any ObserverGateProtocol)? = nil) {
+    /// Starts work only if this enumerator is still wanted.
+    ///
+    /// A `Task` begins running the moment it is created, so a flag checked afterwards cannot stop a
+    /// discarded enumeration from spending the Drive requests it was about to make. The check and the
+    /// registration therefore happen under the same lock `invalidate()` takes, which makes the order
+    /// between the two total: either invalidation wins and no task exists, or the task exists and
+    /// invalidation cancels it.
+    private func start(gate: (any ObserverGateProtocol)? = nil,
+                       dropped: (@Sendable () -> Void)? = nil,
+                       _ work: @escaping @Sendable () async -> Void) {
         stateGate.lock()
         defer { stateGate.unlock() }
         if isInvalidated {
+            ProviderLog.note("dropped work on invalidated \(kindLabel)")
             gate?.close()
-            task.cancel()
-        } else {
-            runningTasks.append(task)
-            if let gate { openGates.append(gate) }
+            dropped?()
+            return
         }
+        let task = Task { await work() }
+        runningTasks.append(task)
+        if let gate { openGates.append(gate) }
     }
 
     /// Called by a finished task so neither it nor its observer outlives the enumeration.
@@ -88,8 +108,10 @@ public final class DriveEnumerator: NSObject, NSFileProviderEnumerator {
         let kind = self.kind
         let services = self.services
         let gate = ObserverGate(observer)
+        let label = kindLabel
+        ProviderLog.note("items begin \(label) page=\(token == nil ? "first" : "continued")")
 
-        track(Task {
+        start(gate: gate) {
             defer { self.retire(gate) }
             do {
                 try Task.checkCancellation()
@@ -99,15 +121,23 @@ public final class DriveEnumerator: NSObject, NSFileProviderEnumerator {
                         parentDriveID: parentDriveID)
                     let result = try await services.drive.childrenPage(
                         parentID: parentDriveID, pageToken: token, includeTrashed: includeTrashed)
+                    // Before mapping, so the first root enumeration is parented with the alias it
+                    // just observed instead of the raw folder id.
+                    await services.observeRootListing(parentDriveID: parentDriveID,
+                                                      files: result.fileList)
                     let items = await services.items(from: result.fileList)
-                    let nextPage = next(result)
+                    let nextPage = self.next(result)
+                    ProviderLog.note("items done \(label) returned=\(result.fileList.count) "
+                                     + "published=\(items.count) more=\(nextPage != nil)")
                     gate.perform { $0.didEnumerate(items) }
                     gate.perform { $0.finishEnumerating(upTo: nextPage) }
 
                 case .trash:
                     let result = try await services.drive.trashedPage(pageToken: token)
                     let items = await services.items(from: result.fileList)
-                    let nextPage = next(result)
+                    let nextPage = self.next(result)
+                    ProviderLog.note("items done trash returned=\(result.fileList.count) "
+                                     + "published=\(items.count) more=\(nextPage != nil)")
                     gate.perform { $0.didEnumerate(items) }
                     gate.perform { $0.finishEnumerating(upTo: nextPage) }
 
@@ -118,9 +148,10 @@ public final class DriveEnumerator: NSObject, NSFileProviderEnumerator {
                     gate.perform { $0.finishEnumerating(upTo: nil) }
                 }
             } catch {
+                ProviderLog.failure("items failed \(label) error=\(error)")
                 gate.perform { $0.finishEnumeratingWithError(ProviderErrorMapper.bridge(error)) }
             }
-        }, gate: gate)
+        }
     }
 
     private func next(_ page: DriveChildrenPage) -> NSFileProviderPage? {
@@ -134,23 +165,27 @@ public final class DriveEnumerator: NSObject, NSFileProviderEnumerator {
                                  from syncAnchor: NSFileProviderSyncAnchor) {
         let requested = ProviderCursor.driveStartToken(from: syncAnchor)
         let kind = self.kind
+        let services = self.services
         let gate = ObserverGate(observer)
+        let label = kindLabel
+        ProviderLog.note("changes begin \(label) anchor=\(requested ?? "none")")
 
-        track(Task {
+        start(gate: gate) {
             defer { self.retire(gate) }
             do {
                 try Task.checkCancellation()
                 switch kind {
                 case .workingSet:
-                    try await enumerateWorkingSetChanges(gate: gate, requested: requested)
+                    try await self.enumerateWorkingSetChanges(gate: gate, requested: requested)
                 case .container(let parentDriveID):
-                    try await enumerateScopedChanges(gate: gate, requested: requested,
-                                                     include: { $0.parentID == parentDriveID })
+                    try await self.enumerateScopedChanges(gate: gate, requested: requested,
+                                                          include: { $0.parentID == parentDriveID })
                 case .trash:
-                    try await enumerateScopedChanges(gate: gate, requested: requested,
-                                                     include: { $0.isTrashed })
+                    try await self.enumerateScopedChanges(gate: gate, requested: requested,
+                                                          include: { $0.isTrashed })
                 }
             } catch {
+                ProviderLog.failure("changes failed \(label) error=\(error)")
                 if ProviderErrorMapper.isAnchorExpired(error) {
                     try? await services.state.clearSyncCursor()
                 }
@@ -158,7 +193,7 @@ public final class DriveEnumerator: NSObject, NSFileProviderEnumerator {
                     $0.finishEnumeratingWithError(ProviderErrorMapper.bridge(error))
                 }
             }
-        }, gate: gate)
+        }
     }
 
     /// The working set is the whole Drive, so the complete changes feed is drained and published.
@@ -178,13 +213,12 @@ public final class DriveEnumerator: NSObject, NSFileProviderEnumerator {
 
         let batch = try await services.drive.collectChanges(
             from: requested, maxPages: Self.changesPagesPerEnumeration)
-        if batch.removedEverything {
-            // Google dropped our history; the only honest answer is to expire the anchor and let the
-            // system re-scan, which it does far more cheaply than a provider could fake.
-            throw NSFileProviderError(.syncAnchorExpired)
-        }
 
-        try await publish(changes: batch.changes, through: gate)
+        let counts = try await publish(changes: batch.changes, through: gate)
+        let anchor = anchorAfter(batch, fallback: requested)
+        ProviderLog.note("changes done \(kindLabel) returned=\(batch.changes.count) "
+                         + "updated=\(counts.updated) deleted=\(counts.deleted) "
+                         + "anchor=\(anchor) more=\(batch.truncated)")
 
         if batch.truncated, let resume = batch.resumeToken {
             gate.perform {
@@ -194,7 +228,6 @@ public final class DriveEnumerator: NSObject, NSFileProviderEnumerator {
             return
         }
 
-        let anchor = batch.startPageToken ?? requested
         try await services.state.setSyncCursor(anchor)
         gate.perform {
             $0.finishEnumeratingChanges(
@@ -220,28 +253,44 @@ public final class DriveEnumerator: NSObject, NSFileProviderEnumerator {
 
         let batch = try await services.drive.collectChanges(
             from: requested, maxPages: Self.changesPagesPerEnumeration)
-        if batch.removedEverything { throw NSFileProviderError(.syncAnchorExpired) }
         // Removals are passed through unfiltered: an identifier the system does not have in this
         // container is a no-op, while dropping it here would leave a stale file on disk.
         let relevant = batch.changes.filter { change in
             guard let file = change.file else { return true }
             return include(file)
         }
-        try await publish(changes: relevant, through: gate)
+        let counts = try await publish(changes: relevant, through: gate)
 
         // A truncated drain has no terminal start token yet, so the anchor handed back is the resume
         // token: reporting the token the call started from would rewind the system's cursor.
-        let anchor = batch.resumeToken ?? batch.startPageToken ?? requested
+        let anchor = anchorAfter(batch, fallback: requested)
         let moreComing = batch.truncated
+        ProviderLog.note("changes done \(kindLabel) scanned=\(batch.changes.count) "
+                         + "matched=\(relevant.count) updated=\(counts.updated) "
+                         + "deleted=\(counts.deleted) anchor=\(anchor) more=\(moreComing)")
         gate.perform {
             $0.finishEnumeratingChanges(
                 upTo: ProviderCursor.anchor(driveStartToken: anchor), moreComing: moreComing)
         }
     }
 
+    /// The token that describes "everything up to this batch", preferring the terminal token Drive
+    /// itself returns for the drain.
+    ///
+    /// When Drive answers with an empty page it still includes `newStartPageToken`, so this is what
+    /// lets a quiet poll advance instead of handing the caller's own token back. Falling back to
+    /// `requested` keeps the cursor from rewinding when a response omits both tokens.
+    private func anchorAfter(_ batch: DriveChangeBatch, fallback: String?) -> String {
+        batch.startPageToken ?? batch.resumeToken ?? fallback ?? ""
+    }
+
+    /// Publishes a batch and reports how much of it reached the observer, which is what distinguishes
+    /// "Drive had no changes" from "the gate closed mid-publish".
+    @discardableResult
     private func publish(changes: [DriveChange],
-                         through gate: ObserverGate<NSFileProviderChangeObserver>) async throws {
-        guard !changes.isEmpty else { return }
+                         through gate: ObserverGate<NSFileProviderChangeObserver>) async throws
+        -> (updated: Int, deleted: Int) {
+        guard !changes.isEmpty else { return (0, 0) }
 
         var hint: Int?
         gate.perform { hint = $0.suggestedBatchSize }
@@ -250,6 +299,7 @@ public final class DriveEnumerator: NSObject, NSFileProviderEnumerator {
         let batchSize = max(1, hint ?? 256)
         var updated: [NSFileProviderItem] = []
         var deleted: [NSFileProviderItemIdentifier] = []
+        var sent = (updated: 0, deleted: 0)
         updated.reserveCapacity(batchSize)
 
         for change in changes {
@@ -282,44 +332,54 @@ public final class DriveEnumerator: NSObject, NSFileProviderEnumerator {
             if updated.count >= batchSize {
                 let batch = updated
                 updated.removeAll(keepingCapacity: true)
-                gate.perform { $0.didUpdate(batch) }
+                if gate.perform({ $0.didUpdate(batch) }) { sent.updated += batch.count }
             }
             if deleted.count >= batchSize {
                 let batch = deleted
                 deleted.removeAll(keepingCapacity: true)
-                gate.perform { $0.didDeleteItems(withIdentifiers: batch) }
+                if gate.perform({ $0.didDeleteItems(withIdentifiers: batch) }) {
+                    sent.deleted += batch.count
+                }
             }
         }
 
         if !updated.isEmpty {
             let batch = updated
-            gate.perform { $0.didUpdate(batch) }
+            if gate.perform({ $0.didUpdate(batch) }) { sent.updated += batch.count }
         }
         if !deleted.isEmpty {
             let batch = deleted
-            gate.perform { $0.didDeleteItems(withIdentifiers: batch) }
+            if gate.perform({ $0.didDeleteItems(withIdentifiers: batch) }) {
+                sent.deleted += batch.count
+            }
         }
+        return sent
     }
 
     // MARK: Anchor
 
     public func currentSyncAnchor(completionHandler: @escaping (NSFileProviderSyncAnchor?) -> Void) {
         let services = self.services
-        track(Task {
+        let label = kindLabel
+        ProviderLog.note("anchor begin \(label)")
+        start(dropped: { completionHandler(nil) }) {
             if let stored = await services.state.syncCursor() {
+                ProviderLog.note("anchor done \(label) stored")
                 completionHandler(ProviderCursor.anchor(driveStartToken: stored))
                 return
             }
             do {
                 let fresh = try await services.drive.startChangeToken()
                 try? await services.state.setSyncCursor(fresh)
+                ProviderLog.note("anchor done \(label) fetched")
                 completionHandler(ProviderCursor.anchor(driveStartToken: fresh))
             } catch {
+                ProviderLog.failure("anchor failed \(label) error=\(error)")
                 // No anchor at all makes the system retry, which is right: inventing one would let
                 // it believe it was up to date.
                 completionHandler(nil)
             }
-        })
+        }
     }
 }
 
@@ -349,10 +409,14 @@ private final class ObserverGate<Observer>: ObserverGateProtocol {
         observer = nil
     }
 
-    func perform(_ body: (Observer) -> Void) {
+    /// Delivers to the observer and reports whether the gate was still open. A publisher that cannot
+    /// tell a dropped batch from an empty one cannot explain why the Finder location stayed stale.
+    @discardableResult
+    func perform(_ body: (Observer) -> Void) -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        guard let observer else { return }
+        guard let observer else { return false }
         body(observer)
+        return true
     }
 }

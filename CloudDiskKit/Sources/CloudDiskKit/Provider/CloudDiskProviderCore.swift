@@ -113,7 +113,7 @@ public actor CloudDiskProviderCore {
             return DriveFileProviderItem.workingSetContainer()
         default:
             let file = try await driveFile(for: identifier)
-            return services.item(for: file, pinned: await services.state.isPinned(file.id))
+            return await services.item(for: file, pinned: await services.state.isPinned(file.id))
         }
     }
 
@@ -141,7 +141,10 @@ public actor CloudDiskProviderCore {
                               requestedVersion: NSFileProviderItemVersion?,
                               progress: Progress) async throws -> FetchedContent {
         let driveID = try requireDriveID(identifier)
+        services.activeReads.begin(driveID)
+        defer { services.activeReads.end(driveID) }
         let destination = try services.temporaryFileURL()
+        ProviderLog.note("fetch begin \(driveID) whole")
 
         do {
             let file = try await services.drive.download(fileID: driveID, to: destination,
@@ -155,9 +158,12 @@ public actor CloudDiskProviderCore {
             await services.cache.store(file)
             let pinned = await services.state.isPinned(driveID)
             try await services.state.record(.init(kind: .download, outcome: .success, subject: file.name))
-            return FetchedContent(url: destination, item: services.item(for: file, pinned: pinned))
+            ProviderLog.note("fetch done \(driveID) bytes=\(DriveService.byteCount(of: destination))")
+            await noteContentArrived(driveID)
+            return FetchedContent(url: destination, item: await services.item(for: file, pinned: pinned))
         } catch {
             try? FileManager.default.removeItem(at: destination)
+            ProviderLog.failure("fetch failed \(driveID) error=\(error)")
             await reportFailure(.download, subject: driveID, error: error)
             throw error
         }
@@ -179,8 +185,12 @@ public actor CloudDiskProviderCore {
                                      strictVersioning: Bool,
                                      progress: Progress) async throws -> FetchedExtent {
         let driveID = try requireDriveID(identifier)
+        services.activeReads.begin(driveID)
+        defer { services.activeReads.end(driveID) }
         let destination = try services.temporaryFileURL()
         let scratch = try services.temporaryFileURL()
+        ProviderLog.note("fetch begin \(driveID) range=\(minimalRange.location)+\(minimalRange.length)"
+                       + " align=\(alignment) strict=\(strictVersioning)")
 
         do {
             let metadata = try await services.drive.file(id: driveID)
@@ -215,8 +225,10 @@ public actor CloudDiskProviderCore {
                 let written = DriveService.byteCount(of: destination)
                 try await services.state.record(.init(kind: .download, outcome: .success,
                                                       subject: file.name))
+                ProviderLog.note("fetch done \(driveID) whole bytes=\(written)")
+                await noteContentArrived(driveID)
                 return FetchedExtent(url: destination,
-                                     item: services.item(for: file, pinned: pinned),
+                                     item: await services.item(for: file, pinned: pinned),
                                      retrievedRange: NSRange(location: 0, length: Int(written)))
             }
 
@@ -241,13 +253,16 @@ public actor CloudDiskProviderCore {
             await services.cache.store(metadata)
             try await services.state.record(.init(kind: .download, outcome: .success,
                                                   subject: metadata.name))
+            ProviderLog.note("fetch done \(driveID) extent=\(extent.start)..<\(extent.end)")
+            await noteContentArrived(driveID)
             return FetchedExtent(url: destination,
-                                 item: services.item(for: metadata, pinned: pinned),
+                                 item: await services.item(for: metadata, pinned: pinned),
                                  retrievedRange: NSRange(location: Int(extent.start),
                                                          length: Int(extent.length)))
         } catch {
             try? FileManager.default.removeItem(at: destination)
             try? FileManager.default.removeItem(at: scratch)
+            ProviderLog.failure("fetch failed \(driveID) error=\(error)")
             await reportFailure(.download, subject: driveID, error: error)
             throw error
         }
@@ -329,7 +344,7 @@ public actor CloudDiskProviderCore {
         await services.cache.store(created)
         try await services.state.record(.init(kind: created.isFolder ? .create : .upload,
                                               outcome: .success, subject: created.name))
-        return WriteOutcome(item: services.item(for: created,
+        return WriteOutcome(item: await services.item(for: created,
                                                 pinned: await services.state.isPinned(created.id)))
     }
 
@@ -432,7 +447,7 @@ public actor CloudDiskProviderCore {
         try await services.state.record(.init(kind: Self.activityKind(for: changedFields),
                                               outcome: .success, subject: result.name))
 
-        return WriteOutcome(item: services.item(for: result, pinned: pinned),
+        return WriteOutcome(item: await services.item(for: result, pinned: pinned),
                             pendingFields: pending,
                             shouldFetchContent: shouldFetchContent)
     }
@@ -486,6 +501,18 @@ public actor CloudDiskProviderCore {
     }
 
     // MARK: - Helpers
+
+    /// Records that bytes for this object reached this Mac, and asks for a sweep once the transfer has
+    /// settled.
+    ///
+    /// The ledger is what auto-eviction measures idleness from, so a file is only ever freed after
+    /// someone stopped reading it; and the sweep is scheduled rather than run, because an extent read is
+    /// one of dozens a single video playback produces.
+    private func noteContentArrived(_ driveID: String) async {
+        await services.state.noteAccess(driveID)
+        await services.eviction.schedule(after: services.eviction.config.settleDelay,
+                                         reason: "download settled")
+    }
 
     private func requireDriveID(_ identifier: NSFileProviderItemIdentifier) throws -> String {
         guard let driveID = ProviderIdentity.driveID(for: identifier) else {
@@ -542,19 +569,19 @@ public actor CloudDiskProviderCore {
         await services.cache.store(match)
 
         guard let localContent, match.hasMediaContent else {
-            return (services.item(for: match, pinned: await services.state.isPinned(match.id)), false)
+            return (await services.item(for: match, pinned: await services.state.isPinned(match.id)), false)
         }
 
         // Same size means the disk copy already is the server copy; anything else is a local edit that
         // survived a restore, so its bytes are pushed onto the matched object rather than discarded.
         if DriveService.byteCount(of: localContent) == match.byteCount {
-            return (services.item(for: match, pinned: await services.state.isPinned(match.id)), false)
+            return (await services.item(for: match, pinned: await services.state.isPinned(match.id)), false)
         }
 
         let updated = try await services.drive.replaceContents(of: match.id, with: localContent,
                                                               name: match.name)
         await services.cache.store(updated)
-        return (services.item(for: updated, pinned: await services.state.isPinned(updated.id)), false)
+        return (await services.item(for: updated, pinned: await services.state.isPinned(updated.id)), false)
     }
 
     private func makeEmptyFile() throws -> URL {

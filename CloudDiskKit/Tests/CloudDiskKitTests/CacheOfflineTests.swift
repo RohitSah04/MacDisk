@@ -462,7 +462,9 @@ final class CacheOfflineTests: XCTestCase {
         XCTAssertEqual(cache.signalIdentifiers, [identifier("P1").rawValue])
         let line = try await activity(.unpin)
         XCTAssertEqual(line.outcome, .success)
-        XCTAssertEqual(line.detail, "No longer kept offline; the copy on disk can be freed")
+        XCTAssertEqual(line.detail,
+                       "No longer kept offline. Finder holds the copy already on disk until it "
+                       + "re-reads the file; new copies can be freed normally")
     }
 
     func testAPinThatCannotBeWrittenIsNotReportedAsPinned() async throws {
@@ -508,6 +510,59 @@ final class CacheOfflineTests: XCTestCase {
 
         let readback = await store.pinnedDriveIDs()
         XCTAssertEqual(readback, ["F2"])
+    }
+
+    // MARK: Preview support
+
+    func testAFileWhoseBytesAreAllPresentPreviewsWithoutARequest() async throws {
+        _ = try file("F1", named: "cover.png", bytes: 4_096)
+
+        let problem = await store.downloadForPreview(driveID: "F1", declaredBytes: 4_096)
+
+        XCTAssertNil(problem)
+        XCTAssertTrue(cache.downloadIdentifiers.isEmpty)
+    }
+
+    func testAFileOnlyPartlyOnDiskIsAskedForInFullAndSaysWhenItDoesNotArrive() async throws {
+        _ = try file("F1", named: "clip.mp4", bytes: 4_096)
+
+        // A short timeout keeps the case honest about waiting without making the suite wait minutes.
+        let answer = await store.downloadForPreview(driveID: "F1", declaredBytes: 5_000_000,
+                                                    timeout: 0.5)
+        let problem = try XCTUnwrap(answer)
+
+        XCTAssertEqual(cache.downloadIdentifiers, [identifier("F1").rawValue])
+        XCTAssertTrue(problem.contains("did not finish"), problem)
+    }
+
+    func testAPreviewDownloadTheSystemRefusesIsSaidInItsOwnWords() async throws {
+        _ = try file("F1", named: "scan.pdf", bytes: 4_096)
+        cache.refuseDownload(identifier("F1"), with: DriveError.notAuthenticated(revoked: false))
+
+        let problem = await store.downloadForPreview(driveID: "F1",
+                                                     declaredBytes: 5_000_000, timeout: 0.5)
+
+        XCTAssertEqual(problem, DriveError.notAuthenticated(revoked: false).localizedDescription)
+    }
+
+    func testAnObjectWithNoBytesToFetchIsNeverWaitedFor() async throws {
+        // A Google-native document declares no size and has no content, so waiting for one is forever.
+        let problem = await store.downloadForPreview(driveID: "F1", declaredBytes: nil, timeout: 0.5)
+
+        XCTAssertNil(problem)
+        XCTAssertTrue(cache.downloadIdentifiers.isEmpty)
+    }
+
+    func testNeedsDownloadComparesTheDiskAgainstTheDeclaration() {
+        XCTAssertTrue(OfflineStore.needsDownload(declaredBytes: 4_096, allocatedBytes: 0))
+        XCTAssertTrue(OfflineStore.needsDownload(declaredBytes: 4_096, allocatedBytes: 2_048))
+        // No path is not the same as an empty file: the object may simply not be on disk yet.
+        XCTAssertTrue(OfflineStore.needsDownload(declaredBytes: 4_096, allocatedBytes: nil))
+        XCTAssertFalse(OfflineStore.needsDownload(declaredBytes: 4_096, allocatedBytes: 4_096))
+        // APFS rounds up to block size, so more blocks than bytes still means the whole object.
+        XCTAssertFalse(OfflineStore.needsDownload(declaredBytes: 4_096, allocatedBytes: 8_192))
+        XCTAssertFalse(OfflineStore.needsDownload(declaredBytes: 0, allocatedBytes: 0))
+        XCTAssertFalse(OfflineStore.needsDownload(declaredBytes: nil, allocatedBytes: nil))
     }
 
     // MARK: Content policy
@@ -579,6 +634,7 @@ final class ScriptedCacheSystem: CacheSystem, @unchecked Sendable {
     private var evicted: [String] = []
     private var downloaded: [String] = []
     private var signalled: [String] = []
+    private var entryCalls = 0
 
     // MARK: Scripting
 
@@ -605,6 +661,9 @@ final class ScriptedCacheSystem: CacheSystem, @unchecked Sendable {
     var evictedIdentifiers: [String] { read { evicted } }
     var downloadIdentifiers: [String] { read { downloaded } }
     var signalIdentifiers: [String] { read { signalled } }
+    /// How many times a pass asked the system what is on disk — the count that proves a scheduled sweep
+    /// coalesced instead of polling.
+    var materializedEntryCalls: Int { read { entryCalls } }
 
     private func mutate(_ body: () -> Void) { lock.lock(); defer { lock.unlock() }; body() }
     private func read<T>(_ body: () -> T) -> T { lock.lock(); defer { lock.unlock() }; return body() }
@@ -612,6 +671,7 @@ final class ScriptedCacheSystem: CacheSystem, @unchecked Sendable {
     // MARK: CacheSystem
 
     func materializedEntries() async throws -> [MaterializedEntry] {
+        mutate { entryCalls += 1 }
         if let failure = read({ inventoryFailure }) { throw failure }
         return read({ entries })
     }

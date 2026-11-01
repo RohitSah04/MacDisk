@@ -187,3 +187,44 @@ public enum CloudDiskMigration {
         return removed
     }
 }
+
+/// Whether the Finder location has to be re-created for this build's item mapping.
+///
+/// File Provider reads an object's dates and permissions from the item at the moment it creates the
+/// file, then leaves them alone while that item's version is unchanged, so a fix to the mapping never
+/// reaches objects a previous build already materialized. Without a rebuild the corrected values are
+/// invisible to the user — a folder nobody could open, a file dated 1677 — and the only remedy would
+/// be deleting the location by hand.
+///
+/// The version sits in App Group defaults with the rest of the state the two processes share.
+public struct MappingUpgrade {
+
+    /// Bumped whenever `DriveFileProviderItem` starts publishing different values for objects that
+    /// may already be on disk. `"2"`: folders advertise the readable and traversable bits, and dates
+    /// the system cannot store — Drive's `1601-01-01` for files imported from elsewhere — fall back
+    /// to the creation time instead of being clamped.
+    public static let currentVersion = "2"
+
+    static let key = "providerMappingVersion"
+
+    private let defaults: UserDefaults?
+    private let version: String
+
+    public init(suite: UserDefaults? = nil, version: String = currentVersion) {
+        defaults = suite ?? UserDefaults(suiteName: CloudDiskConfig.appGroupIdentifier)
+        self.version = version
+    }
+
+    /// True when the location was created by a build that published a different mapping — including
+    /// a build so old it never recorded a version at all.
+    public func isNeeded() -> Bool {
+        defaults?.string(forKey: Self.key) != version
+    }
+
+    /// Called only after a location materialized by this build exists, so a rebuild that failed is
+    /// attempted again on the next launch.
+    public func recordApplied() {
+        defaults?.set(version, forKey: Self.key)
+        defaults?.synchronize()
+    }
+}
