@@ -351,8 +351,10 @@ reading honestly empty.
 
 ## T15 — Persistence across a Mac restart
 
-**NOT TESTED as specified**: the test is a restart of macOS, and restarting the machine in the middle
-of this run would have destroyed the session and the state under test. What was verified instead is
+**NOT TESTED as specified during the run itself**: the test is a restart of macOS, and restarting the
+machine in the middle of this run would have destroyed the session and the state under test. (The real
+restart was performed later the same evening, after commit `eff53d1` was deployed — recorded at the
+end of this section.) What was verified instead is
 the property a restart depends on — that neither the container app nor any user action is needed for
 the location to serve files:
 
@@ -377,6 +379,51 @@ the binding moving to whichever copy Xcode registered last (T1). If `build/dd` o
 deleted while `dist/CloudDisk.app` stays in place, a clean boot should still mount — that is the single
 assertion worth confirming by hand. Restart the Mac, log in, and check that the CloudDisk location
 opens without the app running and without any re-registration or re-consent.
+
+### The real restart — 2026-11-01, 18:52–19:00
+
+Performed after the evening's work: commit `eff53d1` (Smart Auto-Eviction) built into
+`dist/CloudDisk.app`, verified as the serving copy, its auto-eviction validated live on the mount that
+evening, then the Mac rebooted. Every post-reboot check was read-only and the app was never launched.
+
+- **Domain, credential and mount survived the boot untouched.** Three minutes after login: exactly
+  one CloudDisk domain, `dev.rohitsah.clouddisk.CloudDiskProvider/primary-google-drive`; `needs-auth:
+  no` — the keychain credential worked with no app process ever having run in that boot;
+  `fileproviderctl dump` still bound the domain to `dist/CloudDisk.app`; the live folder's
+  `com.apple.file-provider-domain-id` xattr matched; the root listed exactly the pre-reboot **55**
+  objects; and the five stale replica folders were unchanged, with no new ones.
+- **The system spawned the extension at login, from `dist/`, and it served a demand fetch.**
+  `CloudDiskProvider[811]` started 18:52:57 with the app closed. Reading the dataless
+  `<course document>.pdf` materialized it in 4 s — `fetch begin 1vbAB0…
+  range=0+65536 align=16384` → `fetch done … whole bytes=5778`, `du -k` 0 → 8.
+- **The auto-eviction state survived the reboot and ran a second full release cycle unprompted.**
+  The access ledger still held the 18:40:34 access of `<personal document>.pdf` from before the
+  restart: the first post-boot sweep logged `18:54:09 … evict pass done reason=extension start
+  scanned=22 … kept=folder:11,tooRecent:1,unknownAccess:9 next=87s`, correctly projecting the moment
+  that pre-reboot copy would go idle. The re-armed pass then released it — `18:59:25 … evict release
+  1C-jeY… bytes=122880 released=true`, `evict pass done reason=deadline scanned=22 released=1
+  bytes=122880 kept=folder:11,tooRecent:1,unknownAccess:9 failed=0` — and `du -k` on the file fell
+  120 → 0, its Finder row and 2025 dates intact. The file fetched three minutes earlier was correctly
+  kept (`tooRecent:1 next=662s`), and the nine copies with no ledger entry stayed protected.
+- **Sync-anchor persistence across the boot: NOT VERIFIED, deferred.** No `anchor` or `changes`
+  request occurred in the observation window, because with the app closed nothing had polled Drive
+  yet — there was no resume to observe. The process-restart evidence above (anchors `44955`, `44961`)
+  still stands, and a boot adds nothing a process death doesn't (the cursor is a file on disk).
+  Confirm on the next system poll with `log show --info --debug --predicate 'subsystem ==
+  "dev.rohitsah.clouddisk"'` — `anchor done … stored` proves the persisted anchor, `fetched` would
+  mean a fresh token.
+
+Two behaviours recorded exactly as observed:
+
+- **A deadline inside the throttle window waits for the throttle.** The sweeper re-arms at
+  `max(minimumSweepInterval, timeToDeadline)`, so the 18:55:36 eligibility computed at boot was
+  overtaken by the 300 s minimum from the 18:54:09 pass: the freeing pass was floored to 18:59:09 and
+  fired at 18:59:25. Sweeps can run tens of seconds late (`Task.sleep` drift) — never early, which is
+  the invariant that matters.
+- **The first launch of the `eff53d1` app has not happened yet.** MappingUpgrade v2 will rebuild the
+  Finder location once on that launch (downloads preserved), so already-materialized folders pick up
+  the corrected mode and dates. The boot results above describe the location as the previous build
+  left it.
 
 ## T16 — This report
 
