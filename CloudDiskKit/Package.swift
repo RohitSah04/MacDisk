@@ -7,9 +7,7 @@ let package = Package(
         .macOS(.v14)
     ],
     products: [
-        // Static: an app extension linking a dynamic package product has to have that
-        // framework embedded and re-signed in the container app. Static removes that
-        // failure mode for both targets.
+        
         .library(
             name: "CloudDiskKit",
             type: .static,
