@@ -2,10 +2,7 @@ import CloudDiskKit
 import XCTest
 @testable import CloudDisk
 
-/// The sentences the file browser shows after a "keep offline" request.
-///
-/// Only the wording is tested here, but the wording is the part the user acts on: five different system
-/// answers have to stay distinguishable, and two of them must not read as a promise that was kept.
+
 @MainActor
 final class FileBrowserSentenceTests: XCTestCase {
 
