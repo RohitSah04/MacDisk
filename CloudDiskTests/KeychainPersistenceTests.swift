@@ -3,17 +3,7 @@ import Foundation
 import Security
 import XCTest
 
-/// The credential has to land in the data-protection keychain under the group the app and the File
-/// Provider extension both hold entitlements for.
-///
-/// Only a test hosted by the app can check this. A plain command-line binary has no keychain access
-/// group, so every data-protection call it makes fails with `errSecMissingEntitlement` (-34018)
-/// whatever the store does right, and the in-memory `CredentialStore` used elsewhere cannot see a
-/// mistake in the attribute dictionaries at all.
-///
-/// The probe the status screen shows is not enough either: it writes a bare item, while `save()` adds
-/// a label and an accessibility class, so a rejection of one of those reads as "sharing works" on the
-/// status screen and "cannot save" at sign-in.
+
 final class KeychainPersistenceTests: XCTestCase {
 
     /// A store for this test alone. A distinct account keeps the user's real credential untouched.
