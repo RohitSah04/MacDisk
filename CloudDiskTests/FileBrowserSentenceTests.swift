@@ -2,7 +2,6 @@ import CloudDiskKit
 import XCTest
 @testable import CloudDisk
 
-
 @MainActor
 final class FileBrowserSentenceTests: XCTestCase {
 
